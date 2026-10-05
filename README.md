@@ -14,7 +14,7 @@ to `pip install`. Built for Kali/Linux.
 ## Quickstart
 
 ```bash
-sudo install -m 755 pentrail.py /usr/local/bin/pentrail
+python3 pentrail.py setup             # install to PATH + missing tools + config (or do it by hand, below)
 pentrail doctor                       # check what is installed, with apt hints
 pentrail config vpn_dir ~/vpn         # where your .ovpn files live
 pentrail new box1 10.10.10.5          # project + VPN + logbook, pings the target
@@ -25,10 +25,30 @@ pentrail capture recon                # record a shell; exit when done, findings
 pentrail report                       # compile report/report.md when you are done
 ```
 
+`pentrail setup` does the install for you (`pentrail` on `$PATH`, missing tools via
+`apt`, `vpn_dir`, and a `pcd` shell helper), asking before each change. See
+[Install](#install) for the manual steps if you prefer.
+
 Run `pentrail` with no arguments any time for the home screen (where you left off and
 what to do next).
 
 ## Install
+
+The quickest way is the guided installer, which puts `pentrail` on your `$PATH`,
+installs the tools you are missing with `apt`, sets `vpn_dir` and adds the `pcd`
+shell helper. It asks before every change and uses `sudo` only for the install and
+`apt` steps:
+
+```bash
+python3 pentrail.py setup          # guided; or: --yes for unattended
+```
+
+Flags: `--yes` (assume yes, non-interactive), `--core-only` (skip the enumeration
+toolkit), `--vpn-dir <path>`, `--no-tools` / `--no-launcher` / `--no-shell` to skip a
+step, and `--dry-run` to see exactly what it would do without changing anything. Run
+it as your normal user; it elevates only where it must.
+
+Prefer to do it by hand? Install the one file and set your config directly:
 
 ```bash
 sudo install -m 755 pentrail.py /usr/local/bin/pentrail
@@ -500,6 +520,11 @@ web_tool, wordlist, termshot_cmd, connect_timeout, stale_minutes, vpn_iface).
 **`doctor`** - check the environment: core tools, screenshot renderer, enumeration
 tools, config paths and wordlist, each marked ok/missing with an install hint.
 `$ pentrail doctor`
+
+**`setup [--yes] [--core-only] [--vpn-dir PATH] [--dry-run]`** - guided install: put
+`pentrail` on `$PATH`, install missing tools with `apt`, set `vpn_dir`, and add the
+`pcd` shell helper. Asks before each change; `sudo` only for install and `apt`.
+`$ pentrail setup --yes`
 
 **`help [command]`** - this reference, or the long help for one command.
 `$ pentrail help watch`
