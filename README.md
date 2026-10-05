@@ -54,6 +54,21 @@ Prefer to do it by hand? Install the one file and set your config directly:
 sudo install -m 755 pentrail.py /usr/local/bin/pentrail
 ```
 
+### Updating
+
+Once installed, pull the latest and reinstall in one step:
+
+```bash
+pentrail update                 # git pull the source repo + reinstall the launcher
+pentrail update --branch main   # e.g. after a PR is merged to main
+```
+
+`update` finds the source checkout (the repo you run it from, or the one `setup`
+recorded as `src_repo`), runs `git pull --ff-only`, and reinstalls `pentrail` to
+`/usr/local/bin` so the new version is the one that runs. A diverged branch stops it
+before anything is reinstalled, so your local work is never clobbered. By hand it is
+just `git pull` in the repo followed by the `install` line above.
+
 Then set three things once, so a session starts without any prompts:
 
 ```bash
@@ -525,6 +540,10 @@ tools, config paths and wordlist, each marked ok/missing with an install hint.
 `pentrail` on `$PATH`, install missing tools with `apt`, set `vpn_dir`, and add the
 `pcd` shell helper. Asks before each change; `sudo` only for install and `apt`.
 `$ pentrail setup --yes`
+
+**`update [--branch NAME] [--no-install] [--yes] [--dry-run]`** - update pentrail:
+`git pull` the source checkout and reinstall the launcher so the new version runs.
+`$ pentrail update --branch main`
 
 **`help [command]`** - this reference, or the long help for one command.
 `$ pentrail help watch`

@@ -45,6 +45,7 @@ DEFAULTS = {
     "termshot_cmd": "termshot",  # renderer for 'pentrail shot' terminal screenshots
     "web_tool": "feroxbuster",   # directory brute-forcer used in 'next' (feroxbuster/ffuf/gobuster)
     "wordlist": "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
+    "src_repo": "",           # git checkout to pull from on 'pentrail update' (set by setup/update)
 }
 
 # Tools pentrail knows about, used by both 'doctor' (report) and 'setup' (install).
@@ -108,7 +109,8 @@ def load_config():
             warn(f"Could not read {CONFIG_FILE}: {e}")
     for k in ("base_dir", "vpn_dir"):
         cfg[k] = os.path.expanduser(cfg[k])
-    cfg["default_vpn"] = os.path.expanduser(cfg["default_vpn"]) if cfg["default_vpn"] else ""
+    for k in ("default_vpn", "src_repo"):
+        cfg[k] = os.path.expanduser(cfg[k]) if cfg.get(k) else ""
     return cfg
 
 def save_config(cfg):
@@ -1770,6 +1772,36 @@ def _pkg_manager():
         return "apt", lambda pkgs: [*SUDO, "apt", "install", "-y", *pkgs]
     return None, None
 
+def _git_root(start):
+    """The top of the git work tree containing 'start', or None."""
+    try:
+        out = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+def _file_version(path):
+    """Read the VERSION string straight from a pentrail.py on disk (for old->new)."""
+    try:
+        m = re.search(r'^VERSION\s*=\s*"([^"]+)"', path.read_text(), re.M)
+        return m.group(1) if m else "?"
+    except OSError:
+        return "?"
+
+def _remember_src_repo(repo):
+    """Persist the source checkout so the installed launcher can find it later."""
+    try:
+        cfg = dict(load_config())
+        if cfg.get("src_repo") == str(repo):
+            return
+        cfg["src_repo"] = str(repo)
+        save_config({k: cfg.get(k, DEFAULTS[k]) for k in DEFAULTS})
+    except OSError:
+        pass
+
 def _append_shell_helper(assume_yes, dry):
     """Offer to add the pcd() helper to the user's shell rc, idempotently."""
     block = ("\n# >>> pentrail >>>\n"
@@ -1834,6 +1866,10 @@ def cmd_setup(args):
             rc = run([*SUDO, "install", "-m", "755", str(src), str(target)])
             if rc == 0 and not dry:
                 ok(f"Installed. Run it from anywhere: {B}pentrail{N}")
+                repo = _git_root(src.parent)
+                if repo:
+                    _remember_src_repo(repo)
+                    ok(f"source repo remembered for 'pentrail update': {repo}")
                 if not shutil.which("pentrail"):
                     warn(f"{target.parent} is not on your $PATH; add it to use 'pentrail'.")
             elif rc:
@@ -1918,6 +1954,90 @@ def cmd_setup(args):
     _cmd("pentrail new box1 10.10.10.5", "start your first project")
     print(f"  {DIM}tip: pentrail config default_vpn <file.ovpn> skips the VPN picker{N}")
 
+def cmd_update(args):
+    """Update pentrail in place: git pull the source checkout and reinstall the
+    launcher so the new version is the one that runs. Finds the repo from where it
+    runs, or from config['src_repo'] (recorded by setup)."""
+    dry = args.dry_run
+    yes = args.yes
+    def ask(m):
+        if yes:
+            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+        return confirm(m)
+    def run(cmd):
+        info("$ " + " ".join(cmd))
+        if dry:
+            return 0
+        try:
+            return subprocess.call(cmd)
+        except OSError as e:
+            err(f"could not run {cmd[0]}: {e}"); return 1
+
+    # Locate the source checkout --------------------------------------------
+    repo = _git_root(Path(__file__).resolve().parent)
+    from_cfg = False
+    if not repo and CFG.get("src_repo"):
+        cand = Path(CFG["src_repo"])
+        repo = _git_root(cand)
+        from_cfg = bool(repo)
+    if not repo:
+        die("Don't know where pentrail's source repo is. Run 'pentrail update' from "
+            "the git checkout, or point to it:  pentrail config src_repo <path>")
+    src = repo / "pentrail.py"
+    if not src.exists():
+        die(f"No pentrail.py in {repo}. Is that the right checkout?")
+    if not from_cfg and not dry:
+        _remember_src_repo(repo)   # keep it for the installed launcher next time
+
+    git = ["git", "-C", str(repo)]
+    cur_branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True).stdout.strip() or "?"
+    old = _file_version(src)
+    print(f"{B}pentrail update{N}   repo {repo}   branch {cur_branch}   version {old}\n")
+
+    # 1. Pull ----------------------------------------------------------------
+    if args.branch and args.branch != cur_branch:
+        if not ask(f"Switch branch {cur_branch} -> {args.branch}?"):
+            info("Keeping the current branch.")
+        elif run([*git, "checkout", args.branch]) == 0:
+            cur_branch = args.branch
+    if not ask(f"git pull origin {cur_branch}?"):
+        info("Aborted; nothing pulled."); return
+    for attempt in range(4):
+        rc = run([*git, "pull", "--ff-only", "origin", cur_branch])
+        if rc == 0 or dry:
+            break
+        if attempt < 3:
+            wait = 2 ** (attempt + 1)
+            warn(f"pull failed; retrying in {wait}s ({attempt + 1}/3)")
+            time.sleep(wait)
+    else:
+        die("git pull failed. If the branch has diverged, resolve it by hand "
+            "(e.g. 'git -C <repo> status') and re-run. Nothing was reinstalled.")
+
+    new = _file_version(src)
+    if not dry and new == old:
+        ok(f"Already up to date (version {new}).")
+    elif not dry:
+        ok(f"Pulled: version {old} -> {new}.")
+
+    # 2. Reinstall the launcher ---------------------------------------------
+    if args.no_install:
+        info("Skipped reinstall (--no-install)."); return
+    target = Path("/usr/local/bin/pentrail")
+    installed = target.exists()
+    if not installed and not shutil.which("pentrail"):
+        info("pentrail is not installed to a bin dir; run 'pentrail setup' to install it.")
+        return
+    dest = target if installed else Path(shutil.which("pentrail"))
+    if src.resolve() == dest.resolve():
+        ok("Running straight from the repo; nothing to reinstall."); return
+    if not ask(f"Reinstall {src} to {dest} (sudo)?"):
+        info("Skipped the reinstall; the pulled code is in the repo but not on $PATH yet.")
+        return
+    if run([*SUDO, "install", "-m", "755", str(src), str(dest)]) == 0 and not dry:
+        ok(f"Reinstalled {dest}. 'pentrail version' should now show {new}.")
+
 # ----------------------------------------------------------------------------- help guide
 HELP_SECTIONS = [
     ("PROJECT & BOXES", [
@@ -1990,6 +2110,8 @@ HELP_SECTIONS = [
         ("doctor",          "Check installed tools, paths and wordlist; shows apt hints."),
         ("setup",           "Guided install: put pentrail on PATH, install missing tools,",
                             "set vpn_dir and add the pcd shell helper. --yes for unattended."),
+        ("update",          "Update pentrail: git pull the source repo and reinstall the",
+                            "launcher so the new version runs. --branch to pull another branch."),
         ("version",         "Print the version (also: pentrail --version)."),
     ]),
 ]
@@ -2164,6 +2286,16 @@ DETAILS = {
          "--yes runs it unattended (answers yes); --dry-run shows the steps and changes",
          " nothing. termshot is not on apt, so it is only pointed to, not installed."],
         "pentrail setup   ;   pentrail setup --yes --vpn-dir ~/vpn"),
+    "update": ("Pull the latest pentrail and make it the version that runs.",
+        "pentrail update [--branch NAME] [--no-install] [--yes] [--dry-run]",
+        ["Finds the source checkout (the repo you run it from, or the one setup recorded",
+         " in config as src_repo), runs 'git pull --ff-only' on the current branch, and",
+         " reinstalls pentrail.py to /usr/local/bin/pentrail so the new code is live.",
+         "--branch pulls and switches to another branch first (e.g. main after a merge);",
+         " --no-install pulls only; --yes answers every prompt; --dry-run changes nothing.",
+         "A diverged branch stops it (nothing is reinstalled) so your local work is safe;",
+         " network errors on the pull are retried with backoff."],
+        "pentrail update   ;   pentrail update --branch main --yes"),
     "report": ("Compile the whole project into one Markdown report.",
         "pentrail report [--mask]",
         ["Writes report/report.md from the current state: a meta block (target, domain,",
@@ -2350,6 +2482,13 @@ def build_parser():
     s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
     s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     s.set_defaults(func=cmd_setup)
+    s = sub.add_parser("update", aliases=["upgrade"],
+                       help="update pentrail: git pull the source repo and reinstall the launcher")
+    s.add_argument("--branch", help="pull a specific branch (default: the checked-out one)")
+    s.add_argument("--no-install", action="store_true", help="pull only, do not reinstall to /usr/local/bin")
+    s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
+    s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    s.set_defaults(func=cmd_update)
     s = sub.add_parser("help", help="full usage guide (or: pentrail help <command>)")
     s.add_argument("topic", nargs="?"); s.set_defaults(func=None)
     return p
