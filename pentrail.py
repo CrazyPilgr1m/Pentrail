@@ -80,6 +80,56 @@ TOOL_NOTES = {
 def tools_in(group):
     return [(cmd, apt) for cmd, apt, g in TOOLS if g == group]
 
+# Where directory/content wordlists usually live on Kali/Linux, and the filenames
+# the 'next' web brute-force step wants (best first). Used by setup/doctor to find
+# a usable wordlist when the configured one is missing.
+WORDLIST_DIRS = [
+    "/usr/share/seclists/Discovery/Web-Content",
+    "/usr/share/wordlists/seclists/Discovery/Web-Content",
+    "/usr/share/wordlists/dirbuster",
+    "/usr/share/wordlists/dirb",
+    "/usr/share/wordlists",
+    "/usr/share/dirb/wordlists",
+    "/usr/share/dirbuster/wordlists",
+    "/usr/share/wordlists/wfuzz/general",
+    "/usr/share/wfuzz/wordlist/general",
+    "~/wordlists",
+    "~/.local/share/wordlists",
+]
+WORDLIST_NAMES = [
+    "directory-list-2.3-medium.txt", "directory-list-2.3-small.txt",
+    "raft-medium-directories.txt", "raft-small-directories.txt",
+    "raft-large-directories.txt", "common.txt", "big.txt",
+    "directory-list-lowercase-2.3-medium.txt",
+]
+
+def find_wordlists(limit=15):
+    """Directory/content wordlists present in the known dirs, best first and
+    de-duplicated by real path. Bounded: it only globs the known dirs, never the
+    whole filesystem."""
+    seen, out = set(), []
+    def add(p):
+        try:
+            if not p.is_file():
+                return
+            rp = p.resolve()
+        except OSError:
+            return
+        if rp not in seen:
+            seen.add(rp); out.append(p)
+    dirs = [Path(os.path.expanduser(d)) for d in WORDLIST_DIRS]
+    dirs = [d for d in dirs if d.is_dir()]
+    for name in WORDLIST_NAMES:               # preferred names first, in order
+        for d in dirs:
+            add(d / name)
+            for sub in sorted(d.glob(f"*/{name}")):
+                add(sub)
+    for d in dirs:                            # then anything else list-shaped
+        for pat in ("directory-list*.txt", "raft-*-directories*.txt", "*directories*.txt"):
+            for f in sorted(d.glob(pat)):
+                add(f)
+    return out[:limit]
+
 IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 # ----------------------------------------------------------------------------- output
@@ -366,14 +416,31 @@ def vpn_up(arg=None):
         else:
             die("Aborted")
     info(f"Connecting with {os.path.basename(ovpn)} ...")
+    if SUDO:
+        # openvpn needs root (tun device + routing table). Prime sudo best-effort so the
+        # password prompt is up front, not buried once it daemonizes. Do NOT gate on it:
+        # 'sudo -v' validates general sudo and ignores command-specific NOPASSWD rules,
+        # so on a box that only grants NOPASSWD for openvpn it would fail. Let the real
+        # 'sudo openvpn' call below authenticate (and fail cleanly) instead.
+        info("openvpn needs root; you may be asked for your sudo password.")
+        try:
+            subprocess.run([*SUDO, "-v"])
+        except OSError:
+            pass
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     LAST_VPN_FILE.write_text(ovpn)
     PID_FILE.unlink(missing_ok=True)
     LOG_FILE.unlink(missing_ok=True)
+    # --daemon detaches openvpn from this terminal: it keeps running as a root
+    # background process after pentrail exits or the shell closes (persistent).
     if subprocess.run([*SUDO, "openvpn", "--cd", os.path.dirname(ovpn), "--config", ovpn,
                        "--daemon", "--writepid", str(PID_FILE), "--log", str(LOG_FILE)]).returncode != 0:
         die("openvpn could not start")
-    return wait_for_tunnel()
+    connected = wait_for_tunnel()
+    if connected:
+        print(f"  {DIM}Runs as a background daemon - stays up after this terminal closes. "
+              f"'pentrail down' stops it; 'pentrail watch' keeps it alive.{N}")
+    return connected
 
 def vpn_down():
     pid = our_pid()
@@ -1250,6 +1317,21 @@ def web_type(path):
         return "web", "auth surface"
     return "web", ""
 
+# When a pentrail command runs *inside* a capture, 'script' records its own output
+# too. We bracket that output with an invisible APC sentinel (ESC _ ... ESC \, which
+# terminals do not display) so the capture parser can drop it - otherwise viewing your
+# logbook/vectors/creds during a capture would be re-ingested as findings, and repeat
+# captures would keep re-logging the same data. See main() and _strip_capture_echo.
+CAP_BEGIN = "\x1b_pentrail\x1b\\"
+CAP_END = "\x1b_/pentrail\x1b\\"
+_CAP_ECHO_RE = re.compile(re.escape(CAP_BEGIN) + r".*?" + re.escape(CAP_END), re.S)
+
+def _strip_capture_echo(text):
+    """Remove pentrail's own recorded output (sentinel-bracketed) before parsing, so
+    a capture never re-ingests what you merely viewed with pentrail during it."""
+    text = _CAP_ECHO_RE.sub("", text)
+    return text.replace(CAP_BEGIN, "").replace(CAP_END, "")   # drop any unpaired stray
+
 def parse_intel(text):
     """Built-in rules: pull leads out of tool output. Returns a dict of findings."""
     text = strip_ansi(text)
@@ -1318,6 +1400,7 @@ def parse_intel(text):
             "creds": creds[:50], "vulns": vulns, "facts": facts}
 
 def ingest_text(d, st, text, source):
+    text = _strip_capture_echo(text)      # drop pentrail's own output recorded in a capture
     text, nred = redact_text(text)        # scrub the operator's own secrets first
     if nred:
         warn(f"Redacted {nred} token(s) matching your redact list (not parsed, not stored).")
@@ -1434,7 +1517,8 @@ def cmd_capture(args):
     box = d.name
     f = d / "evidence" / "terminal" / f"{box}_{datetime.now():%Y-%m-%d_%H%M%S}_{lbl}.log"
     info(f"Recording shell '{lbl}' to {f}")
-    print(f"{DIM}    work as usual; type 'exit' when done - output is parsed for leads afterwards.{N}")
+    print(f"{DIM}    work as usual; type 'exit' when done - output is parsed for leads afterwards.")
+    print(f"    to view output use 'pentrail shot --last'; don't tail/less the live recording.{N}")
     log_event("capture", f"started {lbl} ({f.name})")
 
     env = dict(os.environ, PENTRAIL_CAPTURE=lbl)
@@ -1451,9 +1535,13 @@ def cmd_capture(args):
 
     # scrub your own registered secrets out of the saved evidence file itself
     raw = f.read_text(errors="replace")
-    clean, nred = redact_text(raw)
+    clean, nred = redact_text(raw)        # keeps the invisible capture-echo markers
+    # saved evidence: drop only the invisible markers (keep the visible session text);
+    # parsing below still gets `clean` with markers so pentrail's own output is dropped.
+    saved = clean.replace(CAP_BEGIN, "").replace(CAP_END, "")
+    if saved != raw:
+        f.write_text(saved)
     if nred:
-        f.write_text(clean)
         warn(f"Scrubbed {nred} of your own secret(s) from {f.name} before saving.")
     ok(f"Recording saved: {f}")
     st = load_state(d)
@@ -1748,8 +1836,13 @@ def cmd_doctor(args):
     row(f".ovpn files in vpn_dir: {n_ovpn}", n_ovpn > 0,
         "" if n_ovpn else "put your VPN configs there, or pass a path to 'up'")
     wl = Path(os.path.expanduser(CFG["wordlist"]))
-    row(f"wordlist: {wl}", wl.exists(),
-        "" if wl.exists() else "set 'pentrail config wordlist <path>' (e.g. SecLists)")
+    if wl.exists():
+        row(f"wordlist: {wl}", True)
+    else:
+        alts = find_wordlists(limit=1)
+        hint = (f"missing; found {alts[0]} - 'pentrail setup' picks one" if alts
+                else "missing; 'sudo apt install seclists' or 'pentrail config wordlist <path>'")
+        row(f"wordlist: {wl}", False, hint)
     row(f"web_tool: {CFG['web_tool']}", bool(shutil.which(CFG["web_tool"])),
         "" if shutil.which(CFG["web_tool"]) else "install it or 'pentrail config web_tool <other>'")
     print(f"  {DIM}redact list: {len(load_redacts())} secret(s){N}")
@@ -1856,6 +1949,8 @@ def cmd_setup(args):
     # 1. Put pentrail on PATH ------------------------------------------------
     if not args.no_launcher:
         print(f"{B}1. Launcher{N}")
+        print(f"  {DIM}Copies this script to /usr/local/bin so you can run 'pentrail' from any")
+        print(f"  directory instead of 'python3 pentrail.py'. Needs sudo once to write there.{N}")
         target = Path("/usr/local/bin/pentrail")
         src = Path(__file__).resolve()
         if src == target.resolve() and target.exists():
@@ -1879,6 +1974,10 @@ def cmd_setup(args):
     # 2. Install missing tools ----------------------------------------------
     if not args.no_tools:
         print(f"{B}2. Tools{N}")
+        print(f"  {DIM}Core tools (openvpn, ip, ping, script) are what pentrail itself needs for")
+        print(f"  the VPN and capture. Enumeration tools (nmap, ffuf, smbclient, ...) are what")
+        print(f"  'pentrail next' suggests - install the ones you use. Installed via apt, with")
+        print(f"  sudo. Pass --core-only to skip the enumeration set.{N}")
         groups = ["core"] if args.core_only else ["core", "enum"]
         mgr, build = _pkg_manager()
         for group in groups:
@@ -1913,6 +2012,9 @@ def cmd_setup(args):
 
     # 3. Config: where your .ovpn files live --------------------------------
     print(f"{B}3. Config{N}")
+    print(f"  {DIM}vpn_dir is the folder pentrail looks in for your .ovpn files. wordlist is")
+    print(f"  the directory list 'pentrail next' uses for web brute-forcing. Config is saved")
+    print(f"  to {CONFIG_FILE}.{N}")
     cfg = dict(load_config())
     cur_vpn = cfg.get("vpn_dir", DEFAULTS["vpn_dir"])
     new_vpn = args.vpn_dir
@@ -1940,11 +2042,60 @@ def cmd_setup(args):
                 ok(f"{key} ready: {dp}")
             except OSError as e:
                 warn(f"could not create {key} {dp}: {e}")
+
+    # wordlist: keep the configured one if present, else find one on the machine
+    wl = Path(os.path.expanduser(cfg.get("wordlist", DEFAULTS["wordlist"])))
+    if wl.exists():
+        ok(f"wordlist present: {wl}")
+    else:
+        found = find_wordlists()
+        if not found:
+            info(f"wordlist not found ({wl}).")
+            print(f"    {DIM}install SecLists ('sudo apt install seclists') or set one by hand:")
+            print(f"    pentrail config wordlist <path>{N}")
+        else:
+            print(f"  {Y}configured wordlist missing{N}; found {len(found)} on this machine"
+                  f" (best first):")
+            for i, f in enumerate(found, 1):
+                print(f"    {i:>2}) {f}")
+            choice = found[0]
+            if not yes:
+                try:
+                    ans = input(f"{Y}[?]{N} use which? [1-{len(found)}, Enter={B}1{N}, s=skip] ").strip().lower()
+                except EOFError:
+                    ans = ""
+                if ans in ("s", "skip"):
+                    choice = None
+                elif ans:
+                    if ans.isdecimal() and 1 <= int(ans) <= len(found):
+                        choice = found[int(ans) - 1]
+                    else:
+                        warn("not a valid choice; leaving wordlist unchanged"); choice = None
+            if choice is None:
+                info("wordlist unchanged.")
+            elif dry:
+                info(f"[dry-run] would set wordlist = {choice}")
+            else:
+                cfg["wordlist"] = str(choice)
+                save_config({k: cfg.get(k, DEFAULTS[k]) for k in DEFAULTS})
+                ok(f"wordlist = {choice}")
+    print()
+
+    # About the VPN ----------------------------------------------------------
+    print(f"{B}About the VPN{N}")
+    print(f"  {DIM}pentrail connects with 'pentrail up' / 'pentrail new', not here. openvpn runs")
+    print(f"  as root (sudo, for the tun device and routes) and as a background daemon, so it")
+    print(f"  stays up after you close the terminal or exit pentrail - you do not need a")
+    print(f"  separate terminal for it. 'pentrail down' stops it; run 'pentrail watch' in its")
+    print(f"  own terminal if you want it auto-restarted when it drops.{N}")
     print()
 
     # 4. Shell helper --------------------------------------------------------
     if not args.no_shell:
         print(f"{B}4. Shell helper{N}")
+        print(f"  {DIM}Adds a pcd() function to your shell so one word jumps into the active")
+        print(f"  project with $TARGET/$VPN_IP set. cd must happen in your own shell, so it")
+        print(f"  cannot be a pentrail command. Added once; safe to re-run.{N}")
         _append_shell_helper(yes, dry)
         print()
 
@@ -2052,7 +2203,8 @@ HELP_SECTIONS = [
         ("dir",             "Print the current project path: cd \"$(pentrail dir)\"."),
     ]),
     ("VPN", [
-        ("up [file.ovpn]",  "Connect. No file: use default_vpn, else last used, else pick."),
+        ("up [file.ovpn]",  "Connect (needs sudo). No file: default_vpn, else last used, else pick.",
+                            "Runs as a root daemon that persists after the terminal closes."),
         ("down",            "Disconnect the VPN."),
         ("restart [file]",  "Reconnect (same file unless you pass one)."),
         ("status",          "Show VPN state + the current project."),
@@ -2229,6 +2381,8 @@ DETAILS = {
          " stop. The whole session is saved to evidence/terminal/<box>_<date>_<label>.log",
          " and then parsed: web paths, open ports, hostnames, credentials and recognised",
          " vulnerability signals become logbook entries and tagged attack vectors.",
+         "pentrail's own output run inside the capture (e.g. 'pentrail log', 'vectors',",
+         " 'creds') is NOT re-ingested, so reviewing your findings mid-capture is safe.",
          "Only one capture runs at a time. Starting another from a second terminal closes",
          " this one first; starting it inside this shell asks you to 'exit' first.",
          "Label is free text: recon, web, sqli, privesc, lateral, whatever fits."],
@@ -2277,14 +2431,17 @@ DETAILS = {
         "pentrail doctor"),
     "setup": ("Get from a fresh Kali to a ready pentrail in one guided command.",
         "pentrail setup [--yes] [--core-only] [--vpn-dir PATH] [--no-tools|--no-launcher|--no-shell] [--dry-run]",
-        ["Walks four steps, asking before each change (sudo only for install and apt):",
+        ["Walks four steps and explains each as it goes, asking before every change",
+         " (sudo only for the install and apt steps):",
          " 1. install this script to /usr/local/bin/pentrail so 'pentrail' works anywhere;",
          " 2. install missing tools with apt - core (openvpn, iproute2, ping, script) and,",
          "    unless --core-only, the enumeration set (nmap, ffuf, smbclient, hydra, ...);",
-         " 3. set vpn_dir and create base_dir/vpn_dir;",
+         " 3. set vpn_dir, create base_dir/vpn_dir, and - if the configured wordlist is",
+         "    missing - find the directory wordlists on this machine and let you pick one;",
          " 4. add the pcd() helper to your shell rc (idempotent).",
-         "--yes runs it unattended (answers yes); --dry-run shows the steps and changes",
-         " nothing. termshot is not on apt, so it is only pointed to, not installed."],
+         "It also explains how the VPN works (a persistent root daemon, no separate",
+         " terminal needed). --yes runs it unattended; --dry-run shows the steps and",
+         " changes nothing. termshot is not on apt, so it is only pointed to, not installed."],
         "pentrail setup   ;   pentrail setup --yes --vpn-dir ~/vpn"),
     "update": ("Pull the latest pentrail and make it the version that runs.",
         "pentrail update [--branch NAME] [--no-install] [--yes] [--dry-run]",
@@ -2493,12 +2650,7 @@ def build_parser():
     s.add_argument("topic", nargs="?"); s.set_defaults(func=None)
     return p
 
-def main():
-    if sys.version_info < (3, 8):
-        sys.exit("pentrail needs Python 3.8 or newer (found "
-                 f"{sys.version_info.major}.{sys.version_info.minor}).")
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
-    warn_if_root()
+def _dispatch():
     parser = build_parser()
     args = parser.parse_args()
     if args.cmd == "help":
@@ -2510,6 +2662,31 @@ def main():
     if not getattr(args, "func", None):
         print_home(); return      # bare 'pentrail' = banner + orientation
     args.func(args)
+
+def main():
+    if sys.version_info < (3, 8):
+        sys.exit("pentrail needs Python 3.8 or newer (found "
+                 f"{sys.version_info.major}.{sys.version_info.minor}).")
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+    warn_if_root()
+    # Running inside a capture: bracket our own terminal output with an invisible
+    # sentinel (ESC _ ... ESC \) so the capture parser drops it and never re-ingests
+    # what you view with pentrail (e.g. 'pentrail log'). Only when stdout is the tty
+    # that 'script' records - not when output is piped to a file.
+    wrap = bool(os.environ.get("PENTRAIL_CAPTURE")) and sys.stdout.isatty()
+    if wrap:
+        try:
+            sys.stdout.write(CAP_BEGIN); sys.stdout.flush()
+        except OSError:
+            wrap = False
+    try:
+        _dispatch()
+    finally:
+        if wrap:
+            try:
+                sys.stdout.write(CAP_END); sys.stdout.flush()
+            except OSError:
+                pass
 
 if __name__ == "__main__":
     main()

@@ -34,10 +34,11 @@ what to do next).
 
 ## Install
 
-The quickest way is the guided installer, which puts `pentrail` on your `$PATH`,
-installs the tools you are missing with `apt`, sets `vpn_dir` and adds the `pcd`
-shell helper. It asks before every change and uses `sudo` only for the install and
-`apt` steps:
+The quickest way is the guided installer, which explains each step as it goes: it
+puts `pentrail` on your `$PATH`, installs the tools you are missing with `apt`, sets
+`vpn_dir`, finds a directory wordlist already on your machine if the configured one is
+missing, and adds the `pcd` shell helper. It asks before every change and uses `sudo`
+only for the install and `apt` steps:
 
 ```bash
 python3 pentrail.py setup          # guided; or: --yes for unattended
@@ -368,6 +369,12 @@ pentrail map                                # hosts plus the movement chain
 ```
 
 ## VPN
+
+`pentrail up` needs root (openvpn creates the tun device and routes), so it asks for
+your `sudo` password. openvpn then runs as a **background daemon**: it stays connected
+after you close the terminal or exit pentrail, so you do not need a separate terminal
+for it. `pentrail down` stops it; run `pentrail watch` in its own terminal if you want
+it auto-restarted when it drops.
 
 | Situation | Command |
 |---|---|
