@@ -45,7 +45,40 @@ DEFAULTS = {
     "termshot_cmd": "termshot",  # renderer for 'pentrail shot' terminal screenshots
     "web_tool": "feroxbuster",   # directory brute-forcer used in 'next' (feroxbuster/ffuf/gobuster)
     "wordlist": "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
+    "src_repo": "",           # git checkout to pull from on 'pentrail update' (set by setup/update)
 }
+
+# Tools pentrail knows about, used by both 'doctor' (report) and 'setup' (install).
+# Each row: command on $PATH, Debian/Kali apt package (None = not from apt), group.
+#   core   - needed for the VPN + capture workflow itself
+#   enum   - enumeration tools 'next' suggests; install the ones you use
+#   extra  - optional, not installed from apt (see the note in TOOL_NOTES)
+TOOLS = [
+    ("openvpn",      "openvpn",       "core"),
+    ("ip",           "iproute2",      "core"),
+    ("ping",         "iputils-ping",  "core"),
+    ("script",       "bsdutils",      "core"),
+    ("termshot",     None,            "extra"),
+    ("nmap",         "nmap",          "enum"),
+    ("feroxbuster",  "feroxbuster",   "enum"),
+    ("ffuf",         "ffuf",          "enum"),
+    ("gobuster",     "gobuster",      "enum"),
+    ("nikto",        "nikto",         "enum"),
+    ("enum4linux-ng","enum4linux-ng", "enum"),
+    ("smbclient",    "smbclient",     "enum"),
+    ("snmpwalk",     "snmp",          "enum"),
+    ("ldapsearch",   "ldap-utils",    "enum"),
+    ("netexec",      "netexec",       "enum"),
+    ("crackmapexec", "crackmapexec",  "enum"),
+    ("hydra",        "hydra",         "enum"),
+    ("hashcat",      "hashcat",       "enum"),
+]
+TOOL_NOTES = {
+    "termshot": "github.com/homeport/termshot  (shot still saves text without it)",
+}
+
+def tools_in(group):
+    return [(cmd, apt) for cmd, apt, g in TOOLS if g == group]
 
 IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
@@ -76,7 +109,8 @@ def load_config():
             warn(f"Could not read {CONFIG_FILE}: {e}")
     for k in ("base_dir", "vpn_dir"):
         cfg[k] = os.path.expanduser(cfg[k])
-    cfg["default_vpn"] = os.path.expanduser(cfg["default_vpn"]) if cfg["default_vpn"] else ""
+    for k in ("default_vpn", "src_repo"):
+        cfg[k] = os.path.expanduser(cfg[k]) if cfg.get(k) else ""
     return cfg
 
 def save_config(cfg):
@@ -1684,24 +1718,24 @@ def cmd_doctor(args):
 
     py = sys.version_info
     print(f"{B}pentrail {VERSION}{N}   Python {py.major}.{py.minor}.{py.micro}   {sys.platform}\n")
+    missing = []
 
     print(f"{B}Core{N} (VPN + capture)")
-    for tool, apt in [("openvpn", "openvpn"), ("ip", "iproute2"),
-                      ("ping", "iputils-ping"), ("script", "bsdutils")]:
+    for tool, apt in tools_in("core"):
         p = shutil.which(tool)
+        if not p: missing.append(tool)
         row(tool, bool(p), p or f"sudo apt install {apt}")
 
     print(f"\n{B}Screenshots{N}")
     r = CFG.get("termshot_cmd", "termshot")
     p = shutil.which(r)
-    row(r, bool(p), p or "github.com/homeport/termshot  (shot still saves text without it)")
+    row(r, bool(p), p or TOOL_NOTES["termshot"])
 
     print(f"\n{B}Enumeration{N} (suggested by 'next'; install what you use)")
-    for tool in ["nmap", "feroxbuster", "ffuf", "gobuster", "nikto", "enum4linux-ng",
-                 "smbclient", "snmpwalk", "ldapsearch", "netexec", "crackmapexec",
-                 "hydra", "hashcat"]:
+    for tool, apt in tools_in("enum"):
         p = shutil.which(tool)
-        row(tool, bool(p), p or "")
+        if not p: missing.append(tool)
+        row(tool, bool(p), p or (f"sudo apt install {apt}" if apt else ""))
 
     print(f"\n{B}Config & paths{N}")
     row(f"config file: {CONFIG_FILE}", CONFIG_FILE.exists(),
@@ -1722,8 +1756,287 @@ def cmd_doctor(args):
     d = current_dir()
     if d:
         print(f"  {DIM}active project: {d.name}{N}")
+    if missing:
+        print(f"\n{Y}[!]{N} {len(missing)} tool(s) missing: {', '.join(missing)}")
+        info("Install them automatically with:  pentrail setup")
     if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
         warn("Running under sudo; run pentrail as your normal user.")
+
+# ----------------------------------------------------------------------------- setup / install
+def _pkg_manager():
+    """The system package manager and a builder for its non-interactive install
+    command, as (name, build(pkgs)->argv). None if we don't recognise one."""
+    if shutil.which("apt-get"):
+        return "apt-get", lambda pkgs: [*SUDO, "apt-get", "install", "-y", *pkgs]
+    if shutil.which("apt"):
+        return "apt", lambda pkgs: [*SUDO, "apt", "install", "-y", *pkgs]
+    return None, None
+
+def _git_root(start):
+    """The top of the git work tree containing 'start', or None."""
+    try:
+        out = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+def _file_version(path):
+    """Read the VERSION string straight from a pentrail.py on disk (for old->new)."""
+    try:
+        m = re.search(r'^VERSION\s*=\s*"([^"]+)"', path.read_text(), re.M)
+        return m.group(1) if m else "?"
+    except OSError:
+        return "?"
+
+def _remember_src_repo(repo):
+    """Persist the source checkout so the installed launcher can find it later."""
+    try:
+        cfg = dict(load_config())
+        if cfg.get("src_repo") == str(repo):
+            return
+        cfg["src_repo"] = str(repo)
+        save_config({k: cfg.get(k, DEFAULTS[k]) for k in DEFAULTS})
+    except OSError:
+        pass
+
+def _append_shell_helper(assume_yes, dry):
+    """Offer to add the pcd() helper to the user's shell rc, idempotently."""
+    block = ("\n# >>> pentrail >>>\n"
+             "# cd into the active project with $TARGET/$VPN_IP already set\n"
+             'pcd() { cd "$(pentrail dir)" && source .env; }\n'
+             "# <<< pentrail <<<\n")
+    shell = os.path.basename(os.environ.get("SHELL", ""))
+    rc = HOME / (".zshrc" if shell == "zsh" else ".bashrc")
+    try:
+        existing = rc.read_text() if rc.exists() else ""
+    except OSError as e:
+        warn(f"Could not read {rc}: {e}"); return
+    if "# >>> pentrail >>>" in existing or "pentrail dir" in existing:
+        ok(f"shell helper already in {rc}"); return
+    if not (assume_yes or confirm(f"Add the pcd() helper to {rc}?")):
+        info(f"Skipped. Add it yourself later:\n    {block.strip()}")
+        return
+    if dry:
+        info(f"[dry-run] would append pcd() to {rc}"); return
+    try:
+        with rc.open("a") as fh:
+            fh.write(block)
+        ok(f"Added pcd() to {rc}  (open a new shell, then: pcd)")
+    except OSError as e:
+        warn(f"Could not write {rc}: {e}")
+
+def cmd_setup(args):
+    """Guided install: put pentrail on PATH, install missing tools, set vpn_dir and
+    offer the shell helper. Uses sudo only for the steps that need it (install, apt)."""
+    dry = args.dry_run
+    yes = args.yes
+    def ask(m):
+        if yes:
+            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+        return confirm(m)
+    def run(cmd):
+        info("$ " + " ".join(cmd))
+        if dry:
+            return 0
+        try:
+            return subprocess.call(cmd)
+        except OSError as e:
+            err(f"could not run {cmd[0]}: {e}"); return 1
+
+    print_banner()
+    print(f"\n{DIM}Guided setup. Nothing is installed without asking"
+          f"{' (dry run: nothing will change)' if dry else ''}.{N}\n")
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        warn("Run setup as your normal user, not with sudo; it calls sudo itself "
+             "only for the install and apt steps.")
+
+    # 1. Put pentrail on PATH ------------------------------------------------
+    if not args.no_launcher:
+        print(f"{B}1. Launcher{N}")
+        target = Path("/usr/local/bin/pentrail")
+        src = Path(__file__).resolve()
+        if src == target.resolve() and target.exists():
+            ok(f"pentrail already installed at {target}")
+        elif not ask(f"Install {src.name} to {target} (sudo)?"):
+            info("Skipped the launcher.")
+        else:
+            rc = run([*SUDO, "install", "-m", "755", str(src), str(target)])
+            if rc == 0 and not dry:
+                ok(f"Installed. Run it from anywhere: {B}pentrail{N}")
+                repo = _git_root(src.parent)
+                if repo:
+                    _remember_src_repo(repo)
+                    ok(f"source repo remembered for 'pentrail update': {repo}")
+                if not shutil.which("pentrail"):
+                    warn(f"{target.parent} is not on your $PATH; add it to use 'pentrail'.")
+            elif rc:
+                warn("install failed; see the error above.")
+        print()
+
+    # 2. Install missing tools ----------------------------------------------
+    if not args.no_tools:
+        print(f"{B}2. Tools{N}")
+        groups = ["core"] if args.core_only else ["core", "enum"]
+        mgr, build = _pkg_manager()
+        for group in groups:
+            wanted = tools_in(group)
+            missing = [(c, apt) for c, apt in wanted if not shutil.which(c)]
+            have = len(wanted) - len(missing)
+            label = "core" if group == "core" else "enumeration"
+            if not missing:
+                ok(f"all {len(wanted)} {label} tools present"); continue
+            names = ", ".join(c for c, _ in missing)
+            pkgs = sorted({apt for _, apt in missing if apt})
+            noapt = [c for c, apt in missing if not apt]
+            print(f"  {Y}missing {label}{N} ({have}/{len(wanted)} present): {names}")
+            if not pkgs:
+                info("nothing here is installable from apt; see notes below.")
+            elif not mgr:
+                warn("No apt/apt-get found. Install with your package manager:")
+                print(f"    {', '.join(pkgs)}")
+            elif ask(f"Install {len(pkgs)} package(s) with {mgr}?  ({' '.join(pkgs)})"):
+                run(build(pkgs))
+            else:
+                info("Skipped.")
+            for c in noapt:
+                note = TOOL_NOTES.get(c)
+                if note:
+                    print(f"    {DIM}{c}: {note}{N}")
+        # Optional extras (not on apt) - point to them, do not install.
+        for c, _apt in tools_in("extra"):
+            if not shutil.which(c) and TOOL_NOTES.get(c):
+                print(f"  {DIM}optional {c}: {TOOL_NOTES[c]}{N}")
+        print()
+
+    # 3. Config: where your .ovpn files live --------------------------------
+    print(f"{B}3. Config{N}")
+    cfg = dict(load_config())
+    cur_vpn = cfg.get("vpn_dir", DEFAULTS["vpn_dir"])
+    new_vpn = args.vpn_dir
+    if new_vpn is None and not yes:
+        try:
+            ans = input(f"{Y}[?]{N} vpn_dir (where your .ovpn files live) [{cur_vpn}]: ").strip()
+        except EOFError:
+            ans = ""
+        new_vpn = ans or None
+    if new_vpn:
+        new_vpn = os.path.expanduser(new_vpn)
+        if not dry:
+            cfg["vpn_dir"] = new_vpn
+            save_config({k: cfg.get(k, DEFAULTS[k]) for k in DEFAULTS})
+        ok(f"vpn_dir = {new_vpn}")
+    else:
+        info(f"vpn_dir unchanged ({cur_vpn})")
+    for key in ("vpn_dir", "base_dir"):
+        dp = Path(os.path.expanduser(cfg.get(key, DEFAULTS[key])))
+        if dry:
+            info(f"[dry-run] would ensure {key} {dp} exists")
+        else:
+            try:
+                dp.mkdir(parents=True, exist_ok=True)
+                ok(f"{key} ready: {dp}")
+            except OSError as e:
+                warn(f"could not create {key} {dp}: {e}")
+    print()
+
+    # 4. Shell helper --------------------------------------------------------
+    if not args.no_shell:
+        print(f"{B}4. Shell helper{N}")
+        _append_shell_helper(yes, dry)
+        print()
+
+    # Done -------------------------------------------------------------------
+    print(f"{B}Next{N}")
+    _cmd("pentrail doctor", "re-check the environment")
+    _cmd("pentrail new box1 10.10.10.5", "start your first project")
+    print(f"  {DIM}tip: pentrail config default_vpn <file.ovpn> skips the VPN picker{N}")
+
+def cmd_update(args):
+    """Update pentrail in place: git pull the source checkout and reinstall the
+    launcher so the new version is the one that runs. Finds the repo from where it
+    runs, or from config['src_repo'] (recorded by setup)."""
+    dry = args.dry_run
+    yes = args.yes
+    def ask(m):
+        if yes:
+            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+        return confirm(m)
+    def run(cmd):
+        info("$ " + " ".join(cmd))
+        if dry:
+            return 0
+        try:
+            return subprocess.call(cmd)
+        except OSError as e:
+            err(f"could not run {cmd[0]}: {e}"); return 1
+
+    # Locate the source checkout --------------------------------------------
+    repo = _git_root(Path(__file__).resolve().parent)
+    from_cfg = False
+    if not repo and CFG.get("src_repo"):
+        cand = Path(CFG["src_repo"])
+        repo = _git_root(cand)
+        from_cfg = bool(repo)
+    if not repo:
+        die("Don't know where pentrail's source repo is. Run 'pentrail update' from "
+            "the git checkout, or point to it:  pentrail config src_repo <path>")
+    src = repo / "pentrail.py"
+    if not src.exists():
+        die(f"No pentrail.py in {repo}. Is that the right checkout?")
+    if not from_cfg and not dry:
+        _remember_src_repo(repo)   # keep it for the installed launcher next time
+
+    git = ["git", "-C", str(repo)]
+    cur_branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True).stdout.strip() or "?"
+    old = _file_version(src)
+    print(f"{B}pentrail update{N}   repo {repo}   branch {cur_branch}   version {old}\n")
+
+    # 1. Pull ----------------------------------------------------------------
+    if args.branch and args.branch != cur_branch:
+        if not ask(f"Switch branch {cur_branch} -> {args.branch}?"):
+            info("Keeping the current branch.")
+        elif run([*git, "checkout", args.branch]) == 0:
+            cur_branch = args.branch
+    if not ask(f"git pull origin {cur_branch}?"):
+        info("Aborted; nothing pulled."); return
+    for attempt in range(4):
+        rc = run([*git, "pull", "--ff-only", "origin", cur_branch])
+        if rc == 0 or dry:
+            break
+        if attempt < 3:
+            wait = 2 ** (attempt + 1)
+            warn(f"pull failed; retrying in {wait}s ({attempt + 1}/3)")
+            time.sleep(wait)
+    else:
+        die("git pull failed. If the branch has diverged, resolve it by hand "
+            "(e.g. 'git -C <repo> status') and re-run. Nothing was reinstalled.")
+
+    new = _file_version(src)
+    if not dry and new == old:
+        ok(f"Already up to date (version {new}).")
+    elif not dry:
+        ok(f"Pulled: version {old} -> {new}.")
+
+    # 2. Reinstall the launcher ---------------------------------------------
+    if args.no_install:
+        info("Skipped reinstall (--no-install)."); return
+    target = Path("/usr/local/bin/pentrail")
+    installed = target.exists()
+    if not installed and not shutil.which("pentrail"):
+        info("pentrail is not installed to a bin dir; run 'pentrail setup' to install it.")
+        return
+    dest = target if installed else Path(shutil.which("pentrail"))
+    if src.resolve() == dest.resolve():
+        ok("Running straight from the repo; nothing to reinstall."); return
+    if not ask(f"Reinstall {src} to {dest} (sudo)?"):
+        info("Skipped the reinstall; the pulled code is in the repo but not on $PATH yet.")
+        return
+    if run([*SUDO, "install", "-m", "755", str(src), str(dest)]) == 0 and not dry:
+        ok(f"Reinstalled {dest}. 'pentrail version' should now show {new}.")
 
 # ----------------------------------------------------------------------------- help guide
 HELP_SECTIONS = [
@@ -1795,6 +2108,10 @@ HELP_SECTIONS = [
         ("config [key] [value]", "Show or set config (base_dir, vpn_dir, default_vpn,",
                             "web_tool, wordlist, termshot_cmd, connect_timeout, ...)."),
         ("doctor",          "Check installed tools, paths and wordlist; shows apt hints."),
+        ("setup",           "Guided install: put pentrail on PATH, install missing tools,",
+                            "set vpn_dir and add the pcd shell helper. --yes for unattended."),
+        ("update",          "Update pentrail: git pull the source repo and reinstall the",
+                            "launcher so the new version runs. --branch to pull another branch."),
         ("version",         "Print the version (also: pentrail --version)."),
     ]),
 ]
@@ -1837,6 +2154,7 @@ def print_home(_args=None):
     else:
         print("No active project.\n")
         print(f"{B}Get started{N}")
+        _cmd("pentrail setup", "install pentrail + missing tools, set vpn_dir")
         _cmd("pentrail new <name> <ip>", "new project: folders, VPN, logbook")
         _cmd("pentrail resume", "resume the project you last worked on")
         _cmd("pentrail list", "list existing projects")
@@ -1957,6 +2275,27 @@ DETAILS = {
          " the wordlist exists, and whether web_tool is installed.",
          "Nothing is changed; it only reports. Run it once after installing pentrail."],
         "pentrail doctor"),
+    "setup": ("Get from a fresh Kali to a ready pentrail in one guided command.",
+        "pentrail setup [--yes] [--core-only] [--vpn-dir PATH] [--no-tools|--no-launcher|--no-shell] [--dry-run]",
+        ["Walks four steps, asking before each change (sudo only for install and apt):",
+         " 1. install this script to /usr/local/bin/pentrail so 'pentrail' works anywhere;",
+         " 2. install missing tools with apt - core (openvpn, iproute2, ping, script) and,",
+         "    unless --core-only, the enumeration set (nmap, ffuf, smbclient, hydra, ...);",
+         " 3. set vpn_dir and create base_dir/vpn_dir;",
+         " 4. add the pcd() helper to your shell rc (idempotent).",
+         "--yes runs it unattended (answers yes); --dry-run shows the steps and changes",
+         " nothing. termshot is not on apt, so it is only pointed to, not installed."],
+        "pentrail setup   ;   pentrail setup --yes --vpn-dir ~/vpn"),
+    "update": ("Pull the latest pentrail and make it the version that runs.",
+        "pentrail update [--branch NAME] [--no-install] [--yes] [--dry-run]",
+        ["Finds the source checkout (the repo you run it from, or the one setup recorded",
+         " in config as src_repo), runs 'git pull --ff-only' on the current branch, and",
+         " reinstalls pentrail.py to /usr/local/bin/pentrail so the new code is live.",
+         "--branch pulls and switches to another branch first (e.g. main after a merge);",
+         " --no-install pulls only; --yes answers every prompt; --dry-run changes nothing.",
+         "A diverged branch stops it (nothing is reinstalled) so your local work is safe;",
+         " network errors on the pull are retried with backoff."],
+        "pentrail update   ;   pentrail update --branch main --yes"),
     "report": ("Compile the whole project into one Markdown report.",
         "pentrail report [--mask]",
         ["Writes report/report.md from the current state: a meta block (target, domain,",
@@ -2134,6 +2473,22 @@ def build_parser():
     s = sub.add_parser("config", help="view or set config")
     s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?"); s.set_defaults(func=cmd_config)
     sub.add_parser("doctor", help="check your environment: installed tools, paths, wordlist").set_defaults(func=cmd_doctor)
+    s = sub.add_parser("setup", help="guided install: PATH launcher, missing tools, vpn_dir, shell helper")
+    s.add_argument("--vpn-dir", help="set vpn_dir (where your .ovpn files live)")
+    s.add_argument("--core-only", action="store_true", help="only core tools, skip the enumeration set")
+    s.add_argument("--no-tools", action="store_true", help="do not install any tools")
+    s.add_argument("--no-launcher", action="store_true", help="do not install pentrail to /usr/local/bin")
+    s.add_argument("--no-shell", action="store_true", help="do not touch your shell rc")
+    s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
+    s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    s.set_defaults(func=cmd_setup)
+    s = sub.add_parser("update", aliases=["upgrade"],
+                       help="update pentrail: git pull the source repo and reinstall the launcher")
+    s.add_argument("--branch", help="pull a specific branch (default: the checked-out one)")
+    s.add_argument("--no-install", action="store_true", help="pull only, do not reinstall to /usr/local/bin")
+    s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
+    s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    s.set_defaults(func=cmd_update)
     s = sub.add_parser("help", help="full usage guide (or: pentrail help <command>)")
     s.add_argument("topic", nargs="?"); s.set_defaults(func=None)
     return p
