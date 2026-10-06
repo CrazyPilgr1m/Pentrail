@@ -154,7 +154,11 @@ def load_config():
     cfg = dict(DEFAULTS)
     if CONFIG_FILE.exists():
         try:
-            cfg.update(json.loads(CONFIG_FILE.read_text()))
+            data = json.loads(CONFIG_FILE.read_text())
+            if isinstance(data, dict):
+                cfg.update(data)
+            else:
+                warn(f"Ignoring {CONFIG_FILE}: not a JSON object")
         except (json.JSONDecodeError, OSError) as e:
             warn(f"Could not read {CONFIG_FILE}: {e}")
     for k in ("base_dir", "vpn_dir"):
@@ -210,7 +214,10 @@ def load_state(d):
     f = d / "state.json"
     if f.exists():
         try:
-            st.update(json.loads(f.read_text()))
+            data = json.loads(f.read_text())
+            if not isinstance(data, dict):
+                raise json.JSONDecodeError("state.json is not a JSON object", "", 0)
+            st.update(data)
         except json.JSONDecodeError:
             # never silently discard a corrupt state; back it up so a later save
             # can't overwrite the only copy, and tell the user.
@@ -344,9 +351,12 @@ def pick_vpn(arg=None):
     for i, f in enumerate(files, 1):
         print(f"  {i}) {f.name}")
     try:
-        return str(files[int(input("Pick a VPN file: ")) - 1])
-    except (ValueError, IndexError, EOFError):
+        n = int(input("Pick a VPN file: "))
+    except (ValueError, EOFError):
         die("Invalid choice")
+    if not 1 <= n <= len(files):      # reject 0 and negatives (which would index from the end)
+        die("Invalid choice")
+    return str(files[n - 1])
 
 LOG_HINTS = [
     (r"AUTH_FAILED|certificate verify failed|VERIFY ERROR",
@@ -600,8 +610,8 @@ See `logbook.md` for the running timeline and `pentrail vectors` for attack vect
 
 def cmd_new(args):
     name = args.name
-    if not re.match(r"^[A-Za-z0-9._-]+$", name):
-        die("Name may only contain letters, digits and . _ -")
+    if name in (".", "..") or not re.match(r"^[A-Za-z0-9._-]+$", name):
+        die("Name may only contain letters, digits and . _ - (and not '.' or '..')")
     target = args.ip or ""
     if target and not IP_RE.match(target):
         die(f"Not a valid IPv4 address: {target}")
@@ -617,10 +627,9 @@ def cmd_new(args):
     CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CURRENT_FILE.write_text(str(d))
 
-    if not vpn_running() and not vpn_up():
-        warn("VPN not connected - see above, or use 'pentrail check' and 'pentrail restart'")
-    vip = tun_ip()
-
+    # Scaffold everything to disk BEFORE touching the VPN, so a VPN that cannot come
+    # up never leaves a half-made project (no .env / state.json / notes). The tunnel
+    # IP is written into .env afterwards, once the VPN is actually connected.
     st = load_state(d)
     if not target:
         target = st.get("target", "")
@@ -629,14 +638,20 @@ def cmd_new(args):
         st["hosts"].append({"ip": target, "name": name, "os": "", "owned": False,
                             "added": f"{datetime.now():%Y-%m-%d %H:%M:%S}"})
     save_state(d, st)
-    write_env(d, target, vip)
+    write_env(d, target, None)
 
     notes = d / "notes" / "notes.md"
     if not notes.exists():
         notes.write_text(NOTES_TEMPLATE.format(
             name=name, when=f"{datetime.now():%Y-%m-%d %H:%M}", target=target or "?",
-            vip=vip or "?", vpn=os.path.basename(_read(LAST_VPN_FILE)) or "?"))
-    log_event("new", f"session started - target {target or '?'}, VPN IP {vip or '?'}")
+            vip="?", vpn=os.path.basename(_read(LAST_VPN_FILE)) or "?"))
+    log_event("new", f"session started - target {target or '?'}")
+
+    if not vpn_running() and not vpn_up():
+        warn("VPN not connected - see above, or use 'pentrail check' and 'pentrail restart'")
+    vip = tun_ip()
+    if vip:
+        write_env(d, target, vip)
 
     if target and vip:
         ok(f"Target {target} reachable") if ping(target, count=2, wait=2) else \
@@ -1074,18 +1089,6 @@ def cmd_flag(args):
         for f in st["flags"]:
             print(f"  {f['name']:<6} {f['value']}  {DIM}{f.get('host','')} {f.get('added','')}{N}")
         return
-
-def cmd_flag(args):
-    d = require_engagement()
-    st = load_state(d)
-    st.setdefault("flags", [])
-    value = " ".join(args.value) if args.value else ""
-    if not value:
-        if not st["flags"]:
-            info("No flags yet. Record one with 'pentrail flag user <value>'."); return
-        for f in st["flags"]:
-            print(f"  {f['name']:<6} {f['value']}  {DIM}{f.get('host','')} {f.get('added','')}{N}")
-        return
     tgt = current_target()
     st["flags"].append({"name": args.name, "value": value, "host": tgt,
                         "added": f"{datetime.now():%Y-%m-%d %H:%M:%S}"})
@@ -1204,6 +1207,7 @@ def cmd_report(args):
             A(f"- `{p.relative_to(d)}`")
 
     out = d / "report" / "report.md"
+    out.parent.mkdir(parents=True, exist_ok=True)   # report/ may be absent on a 'use'd project
     out.write_text("\n".join(L) + "\n")
     log_event("report", f"generated {out.name}" + (" (masked)" if args.mask else ""))
     ok(f"Report written: {out}")
@@ -1369,13 +1373,16 @@ def parse_intel(text):
     for line in text.splitlines():
         if ":::" in line:            # a secretsdump line, already handled above
             continue
-        m = re.search(r"(?:valid|found|success|login)\b.*?\b([A-Za-z0-9._\\-]{2,}):(\S{3,})\b", line, re.I)
-        if m:
+        m = re.search(r"(?:valid|found|success|login)\b.*?\b([A-Za-z0-9._\\-]{2,}):([^/\s]\S{2,})", line, re.I)
+        # skip URL/host:port noise ("...found at http://10.10.10.5:8080/admin")
+        if m and "/" not in m.group(2) and m.group(1).lower() not in (
+                "http", "https", "ftp", "ftps", "ssh", "smb", "ldap", "mysql", "mssql", "rdp"):
             _add({"user": m.group(1), "secret": m.group(2), "kind": cred_kind(m.group(2))})
-    # labelled user=/password=
-    for m in re.finditer(r"\b(user(?:name)?|login)\s*[:=]\s*(\S{2,})", text, re.I):
+    # labelled user=/password= - stop the value at a delimiter so comma/semicolon-joined
+    # pairs don't swallow the next field ("username=admin,password=Secret1")
+    for m in re.finditer(r"\b(user(?:name)?|login)\s*[:=]\s*([^\s,;|]{2,})", text, re.I):
         _add({"user": m.group(2), "secret": "", "kind": "username"})
-    for m in re.finditer(r"\b(pass(?:word)?|pwd|passwd|secret)\s*[:=]\s*(\S{3,})", text, re.I):
+    for m in re.finditer(r"\b(pass(?:word)?|pwd|passwd|secret)\s*[:=]\s*([^\s,;|]{3,})", text, re.I):
         _add({"user": "", "secret": m.group(2), "kind": cred_kind(m.group(2))})
 
     # project facts (domain especially) from common tools
@@ -1509,6 +1516,8 @@ def cmd_capture(args):
             os.kill(m["pid"], signal.SIGTERM)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            warn("A capture from another user owns that pid; leaving it alone.")
         for _ in range(12):
             if not process_alive(m["pid"]):
                 break
@@ -1516,6 +1525,7 @@ def cmd_capture(args):
 
     box = d.name
     f = d / "evidence" / "terminal" / f"{box}_{datetime.now():%Y-%m-%d_%H%M%S}_{lbl}.log"
+    f.parent.mkdir(parents=True, exist_ok=True)   # may be absent on a 'use'd project
     info(f"Recording shell '{lbl}' to {f}")
     print(f"{DIM}    work as usual; type 'exit' when done - output is parsed for leads afterwards.")
     print(f"    to view output use 'pentrail shot --last'; don't tail/less the live recording.{N}")
@@ -1751,10 +1761,13 @@ def cmd_next(args):
 # ----------------------------------------------------------------------------- /etc/hosts
 def cmd_resolve(args):
     hosts_path = Path("/etc/hosts")
-    if args.names and args.names[0] == "--clean":
+    if args.clean:
         kept = [l for l in hosts_path.read_text().splitlines() if "# pentrail:" not in l]
-        _write_hosts(hosts_path, kept)
-        ok("Removed pentrail-added lines from /etc/hosts"); return
+        if _write_hosts(hosts_path, kept) == 0:
+            ok("Removed pentrail-added lines from /etc/hosts")
+        else:
+            warn("Could not write /etc/hosts (sudo failed?)")
+        return
     names = list(args.names)
     ip = current_target()
     if names and IP_RE.match(names[0]):
@@ -1763,6 +1776,7 @@ def cmd_resolve(args):
         die("Usage: pentrail resolve [ip] <hostname> [hostname...]  (ip defaults to the engagement target)")
     tag = f"pentrail:{current_dir().name if current_dir() else 'manual'}"
     lines = hosts_path.read_text().splitlines()
+    added = []
     for name in names:
         if not re.match(r"^[A-Za-z0-9.-]+$", name):
             warn(f"Invalid hostname skipped: {name}"); continue
@@ -1770,16 +1784,23 @@ def cmd_resolve(args):
             warn(f"{name} already in /etc/hosts (not via pentrail) - skipped"); continue
         lines = [l for l in lines if not ("# pentrail:" in l and name in l.split())]
         lines.append(f"{ip}\t{name}\t# {tag}")
-        ok(f"Added {ip}  {name} to /etc/hosts")
-        log_event("resolve", f"{ip} {name}")
-    _write_hosts(hosts_path, lines)
+        added.append(name)
+    if not added:
+        return
+    if _write_hosts(hosts_path, lines) == 0:   # only claim success after the sudo write works
+        for name in added:
+            ok(f"Added {ip}  {name} to /etc/hosts")
+            log_event("resolve", f"{ip} {name}")
+    else:
+        warn("Could not write /etc/hosts (sudo failed?) - nothing added")
 
 def _write_hosts(path, lines):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_DIR / "hosts.tmp"
     tmp.write_text("\n".join(lines) + "\n")
-    subprocess.run([*SUDO, "cp", str(tmp), str(path)])
+    rc = subprocess.run([*SUDO, "cp", str(tmp), str(path)]).returncode
     tmp.unlink(missing_ok=True)
+    return rc
 
 # ----------------------------------------------------------------------------- config
 def cmd_config(args):
@@ -1792,7 +1813,13 @@ def cmd_config(args):
         print(cfg.get(args.key, "")); return
     if args.key not in DEFAULTS:
         die(f"Unknown key: {args.key}. Known: {', '.join(DEFAULTS)}")
-    val = int(args.value) if args.key in ("connect_timeout", "stale_minutes") else args.value
+    if args.key in ("connect_timeout", "stale_minutes"):
+        try:
+            val = int(args.value)
+        except ValueError:
+            die(f"{args.key} must be an integer (got {args.value!r})")
+    else:
+        val = args.value
     cfg[args.key] = val
     save_config({k: cfg[k] for k in DEFAULTS})
     ok(f"{args.key} = {val}  (saved to {CONFIG_FILE})")
@@ -2124,21 +2151,26 @@ def cmd_update(args):
         except OSError as e:
             err(f"could not run {cmd[0]}: {e}"); return 1
 
-    # Locate the source checkout --------------------------------------------
-    repo = _git_root(Path(__file__).resolve().parent)
-    from_cfg = False
-    if not repo and CFG.get("src_repo"):
-        cand = Path(CFG["src_repo"])
-        repo = _git_root(cand)
-        from_cfg = bool(repo)
+    # Locate the source checkout. Try, in order: the tree this script runs from
+    # (python3 pentrail.py update), the directory you're standing in (running the
+    # installed launcher from inside your clone), then the repo setup remembered.
+    # The first candidate that is a git checkout containing pentrail.py wins.
+    cands = [Path(__file__).resolve().parent, Path.cwd()]
+    if CFG.get("src_repo"):
+        cands.append(Path(os.path.expanduser(CFG["src_repo"])))
+    repo = None
+    for c in cands:
+        root = _git_root(c)
+        if root and (root / "pentrail.py").is_file():
+            repo = root
+            break
     if not repo:
-        die("Don't know where pentrail's source repo is. Run 'pentrail update' from "
-            "the git checkout, or point to it:  pentrail config src_repo <path>")
+        die("Don't know where pentrail's source repo is. cd into your pentrail git "
+            "checkout and run 'pentrail update' there, or point to it:  "
+            "pentrail config src_repo <path>")
     src = repo / "pentrail.py"
-    if not src.exists():
-        die(f"No pentrail.py in {repo}. Is that the right checkout?")
-    if not from_cfg and not dry:
-        _remember_src_repo(repo)   # keep it for the installed launcher next time
+    if not dry:
+        _remember_src_repo(repo)   # keep it so the installed launcher finds it next time
 
     git = ["git", "-C", str(repo)]
     cur_branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"],
@@ -2188,6 +2220,113 @@ def cmd_update(args):
         return
     if run([*SUDO, "install", "-m", "755", str(src), str(dest)]) == 0 and not dry:
         ok(f"Reinstalled {dest}. 'pentrail version' should now show {new}.")
+
+def _remove_shell_helper(assume_yes, dry):
+    """Remove the pcd() helper block from the shell rc files (undo setup)."""
+    block_re = re.compile(r"\n?# >>> pentrail >>>.*?# <<< pentrail <<<\n?", re.S)
+    found = False
+    for rc in (HOME / ".zshrc", HOME / ".bashrc"):
+        try:
+            text = rc.read_text() if rc.exists() else ""
+        except OSError as e:
+            warn(f"Could not read {rc}: {e}"); continue
+        if "# >>> pentrail >>>" not in text:
+            continue
+        found = True
+        if not (assume_yes or confirm(f"Remove the pcd() helper from {rc}?")):
+            info(f"Left {rc} unchanged."); continue
+        if dry:
+            info(f"[dry-run] would remove pcd() from {rc}"); continue
+        try:
+            rc.write_text(block_re.sub("\n", text))
+            ok(f"Removed pcd() from {rc}  (open a new shell for it to take effect)")
+        except OSError as e:
+            warn(f"could not write {rc}: {e}")
+    if not found:
+        info("No pcd() helper found in your shell rc.")
+
+def cmd_uninstall(args):
+    """Undo 'pentrail setup': remove the /usr/local/bin launcher and the pcd shell
+    helper; with --config also remove config + VPN state. Your pentest projects are
+    never deleted. Uses sudo only to remove the launcher."""
+    dry = args.dry_run
+    yes = args.yes
+    def ask(m):
+        if yes:
+            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+        return confirm(m)
+    def run(cmd):
+        info("$ " + " ".join(cmd))
+        if dry:
+            return 0
+        try:
+            return subprocess.call(cmd)
+        except OSError as e:
+            err(f"could not run {cmd[0]}: {e}"); return 1
+
+    print_banner()
+    print(f"\n{DIM}Removes the launcher and shell helper. Your pentest projects are never "
+          f"deleted.{' (dry run: nothing will change)' if dry else ''}{N}\n")
+
+    # 0. A running VPN is a root daemon that would be orphaned once the launcher is
+    #    gone (no 'pentrail down' left to stop it), so offer to stop it first.
+    if vpn_running():
+        warn("The VPN is still connected (a root openvpn daemon).")
+        if ask("Stop it now before removing pentrail?"):
+            if not dry:
+                vpn_down()
+            else:
+                info("[dry-run] would run 'pentrail down'")
+
+    # 1. Launcher ------------------------------------------------------------
+    print(f"{B}1. Launcher{N}")
+    target = Path("/usr/local/bin/pentrail")
+    paths = []
+    def consider(p):
+        # Skip a source checkout (pentrail.py inside a git repo) so we never rm the
+        # repo file - only installed launchers. Removing the launcher you're running
+        # is fine on Linux (the inode lives until the process exits).
+        if p in paths or (p.name == "pentrail.py" and _git_root(p.parent)):
+            return
+        if p.exists() or p.is_symlink():
+            paths.append(p)
+    consider(target)
+    w = shutil.which("pentrail")
+    if w:
+        consider(Path(w))
+    if not paths:
+        info("No installed launcher found (nothing in /usr/local/bin or on $PATH).")
+    for p in paths:
+        if ask(f"Remove {p} (sudo)?") and run([*SUDO, "rm", "-f", str(p)]) == 0 and not dry:
+            ok(f"Removed {p}")
+
+    # 2. Shell helper --------------------------------------------------------
+    print(f"\n{B}2. Shell helper{N}")
+    _remove_shell_helper(yes, dry)
+
+    # 3. Settings & VPN state (opt-in) --------------------------------------
+    print(f"\n{B}3. Settings & VPN state{N}")
+    cfgdir, statedir = CONFIG_FILE.parent, STATE_DIR
+    if args.config:
+        for p in (cfgdir, statedir):
+            if not p.is_dir():
+                continue
+            if ask(f"Delete {p}?"):
+                if dry:
+                    info(f"[dry-run] would delete {p}")
+                else:
+                    shutil.rmtree(p, ignore_errors=True); ok(f"Deleted {p}")
+    else:
+        info(f"Kept config ({cfgdir}) and VPN state ({statedir}).")
+        print(f"  {DIM}pass --config to remove those too (your redact list lives there).{N}")
+
+    # 4. Projects are never auto-deleted ------------------------------------
+    base = Path(CFG["base_dir"])
+    print(f"\n{B}Your work is safe{N}")
+    print(f"  {DIM}pentest projects in {base} were NOT touched - delete them yourself if "
+          f"you want them gone.{N}")
+    if not dry:
+        ok("pentrail uninstalled.")
 
 # ----------------------------------------------------------------------------- help guide
 HELP_SECTIONS = [
@@ -2264,6 +2403,8 @@ HELP_SECTIONS = [
                             "set vpn_dir and add the pcd shell helper. --yes for unattended."),
         ("update",          "Update pentrail: git pull the source repo and reinstall the",
                             "launcher so the new version runs. --branch to pull another branch."),
+        ("uninstall",       "Undo setup: remove the launcher and pcd shell helper. --config",
+                            "also removes settings + VPN state; pentest projects are kept."),
         ("version",         "Print the version (also: pentrail --version)."),
     ]),
 ]
@@ -2453,6 +2594,16 @@ DETAILS = {
          "A diverged branch stops it (nothing is reinstalled) so your local work is safe;",
          " network errors on the pull are retried with backoff."],
         "pentrail update   ;   pentrail update --branch main --yes"),
+    "uninstall": ("Undo 'pentrail setup' - remove what it installed, keep your work.",
+        "pentrail uninstall [--config] [--yes] [--dry-run]",
+        ["Removes the /usr/local/bin/pentrail launcher (sudo) and the pcd() helper from",
+         " your shell rc. If the VPN is still connected it offers to stop it first, since",
+         " the root daemon would otherwise be left with no 'pentrail down' to stop it.",
+         "--config also deletes your config and VPN state (~/.config/pentrail and",
+         " ~/.local/state/pentrail, including the redact list). Your pentest projects in",
+         " base_dir are NEVER deleted - remove them yourself if you want them gone.",
+         "--yes answers every prompt; --dry-run shows the steps and changes nothing."],
+        "pentrail uninstall   ;   pentrail uninstall --config --yes"),
     "report": ("Compile the whole project into one Markdown report.",
         "pentrail report [--mask]",
         ["Writes report/report.md from the current state: a meta block (target, domain,",
@@ -2624,7 +2775,8 @@ def build_parser():
     s.set_defaults(func=cmd_report)
 
     s = sub.add_parser("resolve", help="add /etc/hosts entries (resolve --clean to remove)")
-    s.add_argument("names", nargs="+"); s.set_defaults(func=cmd_resolve)
+    s.add_argument("names", nargs="*"); s.add_argument("--clean", action="store_true",
+                   help="remove the /etc/hosts lines pentrail added"); s.set_defaults(func=cmd_resolve)
     sub.add_parser("dir", help="print the current engagement path").set_defaults(
         func=lambda a: print(require_engagement()))
     s = sub.add_parser("config", help="view or set config")
@@ -2646,6 +2798,11 @@ def build_parser():
     s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
     s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     s.set_defaults(func=cmd_update)
+    s = sub.add_parser("uninstall", help="undo setup: remove the launcher + shell helper (--config also removes settings)")
+    s.add_argument("--config", action="store_true", help="also remove config + VPN state (projects are kept)")
+    s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
+    s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    s.set_defaults(func=cmd_uninstall)
     s = sub.add_parser("help", help="full usage guide (or: pentrail help <command>)")
     s.add_argument("topic", nargs="?"); s.set_defaults(func=None)
     return p
