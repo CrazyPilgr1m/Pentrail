@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"                 # bump on every update (point release); see CHANGELOG.md
 SCHEMA = 1                      # state.json layout version, for future migrations
 HOME = Path.home()
 CONFIG_FILE = Path(os.environ.get("PENTRAIL_CONFIG", HOME / ".config" / "pentrail" / "config.json"))
