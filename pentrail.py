@@ -2124,21 +2124,26 @@ def cmd_update(args):
         except OSError as e:
             err(f"could not run {cmd[0]}: {e}"); return 1
 
-    # Locate the source checkout --------------------------------------------
-    repo = _git_root(Path(__file__).resolve().parent)
-    from_cfg = False
-    if not repo and CFG.get("src_repo"):
-        cand = Path(CFG["src_repo"])
-        repo = _git_root(cand)
-        from_cfg = bool(repo)
+    # Locate the source checkout. Try, in order: the tree this script runs from
+    # (python3 pentrail.py update), the directory you're standing in (running the
+    # installed launcher from inside your clone), then the repo setup remembered.
+    # The first candidate that is a git checkout containing pentrail.py wins.
+    cands = [Path(__file__).resolve().parent, Path.cwd()]
+    if CFG.get("src_repo"):
+        cands.append(Path(os.path.expanduser(CFG["src_repo"])))
+    repo = None
+    for c in cands:
+        root = _git_root(c)
+        if root and (root / "pentrail.py").is_file():
+            repo = root
+            break
     if not repo:
-        die("Don't know where pentrail's source repo is. Run 'pentrail update' from "
-            "the git checkout, or point to it:  pentrail config src_repo <path>")
+        die("Don't know where pentrail's source repo is. cd into your pentrail git "
+            "checkout and run 'pentrail update' there, or point to it:  "
+            "pentrail config src_repo <path>")
     src = repo / "pentrail.py"
-    if not src.exists():
-        die(f"No pentrail.py in {repo}. Is that the right checkout?")
-    if not from_cfg and not dry:
-        _remember_src_repo(repo)   # keep it for the installed launcher next time
+    if not dry:
+        _remember_src_repo(repo)   # keep it so the installed launcher finds it next time
 
     git = ["git", "-C", str(repo)]
     cur_branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"],
