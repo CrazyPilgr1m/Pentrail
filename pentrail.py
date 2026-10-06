@@ -2194,6 +2194,113 @@ def cmd_update(args):
     if run([*SUDO, "install", "-m", "755", str(src), str(dest)]) == 0 and not dry:
         ok(f"Reinstalled {dest}. 'pentrail version' should now show {new}.")
 
+def _remove_shell_helper(assume_yes, dry):
+    """Remove the pcd() helper block from the shell rc files (undo setup)."""
+    block_re = re.compile(r"\n?# >>> pentrail >>>.*?# <<< pentrail <<<\n?", re.S)
+    found = False
+    for rc in (HOME / ".zshrc", HOME / ".bashrc"):
+        try:
+            text = rc.read_text() if rc.exists() else ""
+        except OSError as e:
+            warn(f"Could not read {rc}: {e}"); continue
+        if "# >>> pentrail >>>" not in text:
+            continue
+        found = True
+        if not (assume_yes or confirm(f"Remove the pcd() helper from {rc}?")):
+            info(f"Left {rc} unchanged."); continue
+        if dry:
+            info(f"[dry-run] would remove pcd() from {rc}"); continue
+        try:
+            rc.write_text(block_re.sub("\n", text))
+            ok(f"Removed pcd() from {rc}  (open a new shell for it to take effect)")
+        except OSError as e:
+            warn(f"could not write {rc}: {e}")
+    if not found:
+        info("No pcd() helper found in your shell rc.")
+
+def cmd_uninstall(args):
+    """Undo 'pentrail setup': remove the /usr/local/bin launcher and the pcd shell
+    helper; with --config also remove config + VPN state. Your pentest projects are
+    never deleted. Uses sudo only to remove the launcher."""
+    dry = args.dry_run
+    yes = args.yes
+    def ask(m):
+        if yes:
+            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+        return confirm(m)
+    def run(cmd):
+        info("$ " + " ".join(cmd))
+        if dry:
+            return 0
+        try:
+            return subprocess.call(cmd)
+        except OSError as e:
+            err(f"could not run {cmd[0]}: {e}"); return 1
+
+    print_banner()
+    print(f"\n{DIM}Removes the launcher and shell helper. Your pentest projects are never "
+          f"deleted.{' (dry run: nothing will change)' if dry else ''}{N}\n")
+
+    # 0. A running VPN is a root daemon that would be orphaned once the launcher is
+    #    gone (no 'pentrail down' left to stop it), so offer to stop it first.
+    if vpn_running():
+        warn("The VPN is still connected (a root openvpn daemon).")
+        if ask("Stop it now before removing pentrail?"):
+            if not dry:
+                vpn_down()
+            else:
+                info("[dry-run] would run 'pentrail down'")
+
+    # 1. Launcher ------------------------------------------------------------
+    print(f"{B}1. Launcher{N}")
+    target = Path("/usr/local/bin/pentrail")
+    paths = []
+    def consider(p):
+        # Skip a source checkout (pentrail.py inside a git repo) so we never rm the
+        # repo file - only installed launchers. Removing the launcher you're running
+        # is fine on Linux (the inode lives until the process exits).
+        if p in paths or (p.name == "pentrail.py" and _git_root(p.parent)):
+            return
+        if p.exists() or p.is_symlink():
+            paths.append(p)
+    consider(target)
+    w = shutil.which("pentrail")
+    if w:
+        consider(Path(w))
+    if not paths:
+        info("No installed launcher found (nothing in /usr/local/bin or on $PATH).")
+    for p in paths:
+        if ask(f"Remove {p} (sudo)?") and run([*SUDO, "rm", "-f", str(p)]) == 0 and not dry:
+            ok(f"Removed {p}")
+
+    # 2. Shell helper --------------------------------------------------------
+    print(f"\n{B}2. Shell helper{N}")
+    _remove_shell_helper(yes, dry)
+
+    # 3. Settings & VPN state (opt-in) --------------------------------------
+    print(f"\n{B}3. Settings & VPN state{N}")
+    cfgdir, statedir = CONFIG_FILE.parent, STATE_DIR
+    if args.config:
+        for p in (cfgdir, statedir):
+            if not p.is_dir():
+                continue
+            if ask(f"Delete {p}?"):
+                if dry:
+                    info(f"[dry-run] would delete {p}")
+                else:
+                    shutil.rmtree(p, ignore_errors=True); ok(f"Deleted {p}")
+    else:
+        info(f"Kept config ({cfgdir}) and VPN state ({statedir}).")
+        print(f"  {DIM}pass --config to remove those too (your redact list lives there).{N}")
+
+    # 4. Projects are never auto-deleted ------------------------------------
+    base = Path(CFG["base_dir"])
+    print(f"\n{B}Your work is safe{N}")
+    print(f"  {DIM}pentest projects in {base} were NOT touched - delete them yourself if "
+          f"you want them gone.{N}")
+    if not dry:
+        ok("pentrail uninstalled.")
+
 # ----------------------------------------------------------------------------- help guide
 HELP_SECTIONS = [
     ("PROJECT & BOXES", [
@@ -2269,6 +2376,8 @@ HELP_SECTIONS = [
                             "set vpn_dir and add the pcd shell helper. --yes for unattended."),
         ("update",          "Update pentrail: git pull the source repo and reinstall the",
                             "launcher so the new version runs. --branch to pull another branch."),
+        ("uninstall",       "Undo setup: remove the launcher and pcd shell helper. --config",
+                            "also removes settings + VPN state; pentest projects are kept."),
         ("version",         "Print the version (also: pentrail --version)."),
     ]),
 ]
@@ -2458,6 +2567,16 @@ DETAILS = {
          "A diverged branch stops it (nothing is reinstalled) so your local work is safe;",
          " network errors on the pull are retried with backoff."],
         "pentrail update   ;   pentrail update --branch main --yes"),
+    "uninstall": ("Undo 'pentrail setup' - remove what it installed, keep your work.",
+        "pentrail uninstall [--config] [--yes] [--dry-run]",
+        ["Removes the /usr/local/bin/pentrail launcher (sudo) and the pcd() helper from",
+         " your shell rc. If the VPN is still connected it offers to stop it first, since",
+         " the root daemon would otherwise be left with no 'pentrail down' to stop it.",
+         "--config also deletes your config and VPN state (~/.config/pentrail and",
+         " ~/.local/state/pentrail, including the redact list). Your pentest projects in",
+         " base_dir are NEVER deleted - remove them yourself if you want them gone.",
+         "--yes answers every prompt; --dry-run shows the steps and changes nothing."],
+        "pentrail uninstall   ;   pentrail uninstall --config --yes"),
     "report": ("Compile the whole project into one Markdown report.",
         "pentrail report [--mask]",
         ["Writes report/report.md from the current state: a meta block (target, domain,",
@@ -2651,6 +2770,11 @@ def build_parser():
     s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
     s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     s.set_defaults(func=cmd_update)
+    s = sub.add_parser("uninstall", help="undo setup: remove the launcher + shell helper (--config also removes settings)")
+    s.add_argument("--config", action="store_true", help="also remove config + VPN state (projects are kept)")
+    s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
+    s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    s.set_defaults(func=cmd_uninstall)
     s = sub.add_parser("help", help="full usage guide (or: pentrail help <command>)")
     s.add_argument("topic", nargs="?"); s.set_defaults(func=None)
     return p
