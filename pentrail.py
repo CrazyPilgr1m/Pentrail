@@ -154,7 +154,11 @@ def load_config():
     cfg = dict(DEFAULTS)
     if CONFIG_FILE.exists():
         try:
-            cfg.update(json.loads(CONFIG_FILE.read_text()))
+            data = json.loads(CONFIG_FILE.read_text())
+            if isinstance(data, dict):
+                cfg.update(data)
+            else:
+                warn(f"Ignoring {CONFIG_FILE}: not a JSON object")
         except (json.JSONDecodeError, OSError) as e:
             warn(f"Could not read {CONFIG_FILE}: {e}")
     for k in ("base_dir", "vpn_dir"):
@@ -210,7 +214,10 @@ def load_state(d):
     f = d / "state.json"
     if f.exists():
         try:
-            st.update(json.loads(f.read_text()))
+            data = json.loads(f.read_text())
+            if not isinstance(data, dict):
+                raise json.JSONDecodeError("state.json is not a JSON object", "", 0)
+            st.update(data)
         except json.JSONDecodeError:
             # never silently discard a corrupt state; back it up so a later save
             # can't overwrite the only copy, and tell the user.
@@ -344,9 +351,12 @@ def pick_vpn(arg=None):
     for i, f in enumerate(files, 1):
         print(f"  {i}) {f.name}")
     try:
-        return str(files[int(input("Pick a VPN file: ")) - 1])
-    except (ValueError, IndexError, EOFError):
+        n = int(input("Pick a VPN file: "))
+    except (ValueError, EOFError):
         die("Invalid choice")
+    if not 1 <= n <= len(files):      # reject 0 and negatives (which would index from the end)
+        die("Invalid choice")
+    return str(files[n - 1])
 
 LOG_HINTS = [
     (r"AUTH_FAILED|certificate verify failed|VERIFY ERROR",
@@ -600,8 +610,8 @@ See `logbook.md` for the running timeline and `pentrail vectors` for attack vect
 
 def cmd_new(args):
     name = args.name
-    if not re.match(r"^[A-Za-z0-9._-]+$", name):
-        die("Name may only contain letters, digits and . _ -")
+    if name in (".", "..") or not re.match(r"^[A-Za-z0-9._-]+$", name):
+        die("Name may only contain letters, digits and . _ - (and not '.' or '..')")
     target = args.ip or ""
     if target and not IP_RE.match(target):
         die(f"Not a valid IPv4 address: {target}")
@@ -617,10 +627,9 @@ def cmd_new(args):
     CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CURRENT_FILE.write_text(str(d))
 
-    if not vpn_running() and not vpn_up():
-        warn("VPN not connected - see above, or use 'pentrail check' and 'pentrail restart'")
-    vip = tun_ip()
-
+    # Scaffold everything to disk BEFORE touching the VPN, so a VPN that cannot come
+    # up never leaves a half-made project (no .env / state.json / notes). The tunnel
+    # IP is written into .env afterwards, once the VPN is actually connected.
     st = load_state(d)
     if not target:
         target = st.get("target", "")
@@ -629,14 +638,20 @@ def cmd_new(args):
         st["hosts"].append({"ip": target, "name": name, "os": "", "owned": False,
                             "added": f"{datetime.now():%Y-%m-%d %H:%M:%S}"})
     save_state(d, st)
-    write_env(d, target, vip)
+    write_env(d, target, None)
 
     notes = d / "notes" / "notes.md"
     if not notes.exists():
         notes.write_text(NOTES_TEMPLATE.format(
             name=name, when=f"{datetime.now():%Y-%m-%d %H:%M}", target=target or "?",
-            vip=vip or "?", vpn=os.path.basename(_read(LAST_VPN_FILE)) or "?"))
-    log_event("new", f"session started - target {target or '?'}, VPN IP {vip or '?'}")
+            vip="?", vpn=os.path.basename(_read(LAST_VPN_FILE)) or "?"))
+    log_event("new", f"session started - target {target or '?'}")
+
+    if not vpn_running() and not vpn_up():
+        warn("VPN not connected - see above, or use 'pentrail check' and 'pentrail restart'")
+    vip = tun_ip()
+    if vip:
+        write_env(d, target, vip)
 
     if target and vip:
         ok(f"Target {target} reachable") if ping(target, count=2, wait=2) else \
@@ -1074,18 +1089,6 @@ def cmd_flag(args):
         for f in st["flags"]:
             print(f"  {f['name']:<6} {f['value']}  {DIM}{f.get('host','')} {f.get('added','')}{N}")
         return
-
-def cmd_flag(args):
-    d = require_engagement()
-    st = load_state(d)
-    st.setdefault("flags", [])
-    value = " ".join(args.value) if args.value else ""
-    if not value:
-        if not st["flags"]:
-            info("No flags yet. Record one with 'pentrail flag user <value>'."); return
-        for f in st["flags"]:
-            print(f"  {f['name']:<6} {f['value']}  {DIM}{f.get('host','')} {f.get('added','')}{N}")
-        return
     tgt = current_target()
     st["flags"].append({"name": args.name, "value": value, "host": tgt,
                         "added": f"{datetime.now():%Y-%m-%d %H:%M:%S}"})
@@ -1204,6 +1207,7 @@ def cmd_report(args):
             A(f"- `{p.relative_to(d)}`")
 
     out = d / "report" / "report.md"
+    out.parent.mkdir(parents=True, exist_ok=True)   # report/ may be absent on a 'use'd project
     out.write_text("\n".join(L) + "\n")
     log_event("report", f"generated {out.name}" + (" (masked)" if args.mask else ""))
     ok(f"Report written: {out}")
@@ -1369,13 +1373,16 @@ def parse_intel(text):
     for line in text.splitlines():
         if ":::" in line:            # a secretsdump line, already handled above
             continue
-        m = re.search(r"(?:valid|found|success|login)\b.*?\b([A-Za-z0-9._\\-]{2,}):(\S{3,})\b", line, re.I)
-        if m:
+        m = re.search(r"(?:valid|found|success|login)\b.*?\b([A-Za-z0-9._\\-]{2,}):([^/\s]\S{2,})", line, re.I)
+        # skip URL/host:port noise ("...found at http://10.10.10.5:8080/admin")
+        if m and "/" not in m.group(2) and m.group(1).lower() not in (
+                "http", "https", "ftp", "ftps", "ssh", "smb", "ldap", "mysql", "mssql", "rdp"):
             _add({"user": m.group(1), "secret": m.group(2), "kind": cred_kind(m.group(2))})
-    # labelled user=/password=
-    for m in re.finditer(r"\b(user(?:name)?|login)\s*[:=]\s*(\S{2,})", text, re.I):
+    # labelled user=/password= - stop the value at a delimiter so comma/semicolon-joined
+    # pairs don't swallow the next field ("username=admin,password=Secret1")
+    for m in re.finditer(r"\b(user(?:name)?|login)\s*[:=]\s*([^\s,;|]{2,})", text, re.I):
         _add({"user": m.group(2), "secret": "", "kind": "username"})
-    for m in re.finditer(r"\b(pass(?:word)?|pwd|passwd|secret)\s*[:=]\s*(\S{3,})", text, re.I):
+    for m in re.finditer(r"\b(pass(?:word)?|pwd|passwd|secret)\s*[:=]\s*([^\s,;|]{3,})", text, re.I):
         _add({"user": "", "secret": m.group(2), "kind": cred_kind(m.group(2))})
 
     # project facts (domain especially) from common tools
@@ -1509,6 +1516,8 @@ def cmd_capture(args):
             os.kill(m["pid"], signal.SIGTERM)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            warn("A capture from another user owns that pid; leaving it alone.")
         for _ in range(12):
             if not process_alive(m["pid"]):
                 break
@@ -1516,6 +1525,7 @@ def cmd_capture(args):
 
     box = d.name
     f = d / "evidence" / "terminal" / f"{box}_{datetime.now():%Y-%m-%d_%H%M%S}_{lbl}.log"
+    f.parent.mkdir(parents=True, exist_ok=True)   # may be absent on a 'use'd project
     info(f"Recording shell '{lbl}' to {f}")
     print(f"{DIM}    work as usual; type 'exit' when done - output is parsed for leads afterwards.")
     print(f"    to view output use 'pentrail shot --last'; don't tail/less the live recording.{N}")
@@ -1751,10 +1761,13 @@ def cmd_next(args):
 # ----------------------------------------------------------------------------- /etc/hosts
 def cmd_resolve(args):
     hosts_path = Path("/etc/hosts")
-    if args.names and args.names[0] == "--clean":
+    if args.clean:
         kept = [l for l in hosts_path.read_text().splitlines() if "# pentrail:" not in l]
-        _write_hosts(hosts_path, kept)
-        ok("Removed pentrail-added lines from /etc/hosts"); return
+        if _write_hosts(hosts_path, kept) == 0:
+            ok("Removed pentrail-added lines from /etc/hosts")
+        else:
+            warn("Could not write /etc/hosts (sudo failed?)")
+        return
     names = list(args.names)
     ip = current_target()
     if names and IP_RE.match(names[0]):
@@ -1763,6 +1776,7 @@ def cmd_resolve(args):
         die("Usage: pentrail resolve [ip] <hostname> [hostname...]  (ip defaults to the engagement target)")
     tag = f"pentrail:{current_dir().name if current_dir() else 'manual'}"
     lines = hosts_path.read_text().splitlines()
+    added = []
     for name in names:
         if not re.match(r"^[A-Za-z0-9.-]+$", name):
             warn(f"Invalid hostname skipped: {name}"); continue
@@ -1770,16 +1784,23 @@ def cmd_resolve(args):
             warn(f"{name} already in /etc/hosts (not via pentrail) - skipped"); continue
         lines = [l for l in lines if not ("# pentrail:" in l and name in l.split())]
         lines.append(f"{ip}\t{name}\t# {tag}")
-        ok(f"Added {ip}  {name} to /etc/hosts")
-        log_event("resolve", f"{ip} {name}")
-    _write_hosts(hosts_path, lines)
+        added.append(name)
+    if not added:
+        return
+    if _write_hosts(hosts_path, lines) == 0:   # only claim success after the sudo write works
+        for name in added:
+            ok(f"Added {ip}  {name} to /etc/hosts")
+            log_event("resolve", f"{ip} {name}")
+    else:
+        warn("Could not write /etc/hosts (sudo failed?) - nothing added")
 
 def _write_hosts(path, lines):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_DIR / "hosts.tmp"
     tmp.write_text("\n".join(lines) + "\n")
-    subprocess.run([*SUDO, "cp", str(tmp), str(path)])
+    rc = subprocess.run([*SUDO, "cp", str(tmp), str(path)]).returncode
     tmp.unlink(missing_ok=True)
+    return rc
 
 # ----------------------------------------------------------------------------- config
 def cmd_config(args):
@@ -1792,7 +1813,13 @@ def cmd_config(args):
         print(cfg.get(args.key, "")); return
     if args.key not in DEFAULTS:
         die(f"Unknown key: {args.key}. Known: {', '.join(DEFAULTS)}")
-    val = int(args.value) if args.key in ("connect_timeout", "stale_minutes") else args.value
+    if args.key in ("connect_timeout", "stale_minutes"):
+        try:
+            val = int(args.value)
+        except ValueError:
+            die(f"{args.key} must be an integer (got {args.value!r})")
+    else:
+        val = args.value
     cfg[args.key] = val
     save_config({k: cfg[k] for k in DEFAULTS})
     ok(f"{args.key} = {val}  (saved to {CONFIG_FILE})")
@@ -2748,7 +2775,8 @@ def build_parser():
     s.set_defaults(func=cmd_report)
 
     s = sub.add_parser("resolve", help="add /etc/hosts entries (resolve --clean to remove)")
-    s.add_argument("names", nargs="+"); s.set_defaults(func=cmd_resolve)
+    s.add_argument("names", nargs="*"); s.add_argument("--clean", action="store_true",
+                   help="remove the /etc/hosts lines pentrail added"); s.set_defaults(func=cmd_resolve)
     sub.add_parser("dir", help="print the current engagement path").set_defaults(
         func=lambda a: print(require_engagement()))
     s = sub.add_parser("config", help="view or set config")
