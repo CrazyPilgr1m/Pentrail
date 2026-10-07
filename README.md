@@ -70,6 +70,10 @@ recorded as `src_repo`), runs `git pull --ff-only`, and reinstalls `pentrail` to
 before anything is reinstalled, so your local work is never clobbered. By hand it is
 just `git pull` in the repo followed by the `install` line above.
 
+pentrail uses point releases: every update bumps `VERSION` (1.0 → 1.1 → …), so
+`pentrail version` tells you what you are on and `update` prints the old → new
+version. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+
 Then set three things once, so a session starts without any prompts:
 
 ```bash
