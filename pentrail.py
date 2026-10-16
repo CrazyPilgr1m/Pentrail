@@ -240,7 +240,7 @@ def new_state():
     # web:      web paths and URLs seen                 {host, url, status, note, by, added}
     # commands: what found things, for 'Found by'       {id, cmd, prog, ts, dur, rc, phase, file, hosts, via}
     return {"schema": SCHEMA, "target": "", "phase": "enum", "hosts": [], "vectors": [],
-            "creds": [], "names": [], "web": [], "commands": [], "checks": {},
+            "creds": [], "names": [], "web": [], "commands": [], "checks": {}, "dns": {}, "notes": [],
             "flags": [], "facts": {}, "focus": "", "ingested": {}}
 
 def host_entry(ip, name="", os_=""):
@@ -387,10 +387,6 @@ def cmd_log(args):
                "phase": Y}.get(tag, "")
         print(col + l + N if col else l)
 
-def cmd_note(args):
-    require_engagement()
-    log_event("note", " ".join(args.text))
-    ok("Noted in the logbook")
 # ----------------------------------------------------------------------------- helpers (VPN plumbing)
 def iface():
     m = re.findall(r"TUN/TAP device (\S+) opened", _read(LOG_FILE))
@@ -829,31 +825,49 @@ def _plausible_tld(tld):
     return (len(tld) == 2 and tld.isalpha() and tld not in FILE_EXTS) or tld in COMMON_TLDS
 
 class Scope:
-    """The project scope plus what pentrail knows about hostnames (host aliases,
-    discovered names with an IP, /etc/hosts), so a name that points at an in-scope
-    IP counts as in scope too."""
+    """The project scope, plus what pentrail knows about hostnames: host aliases,
+    names seen with an IP, DNS answers (state 'dns') and /etc/hosts. A name that
+    resolves into the in-scope IPs is in scope; an out-of-scope name that resolves
+    into them turns that IP into a conflict you have to settle."""
     def __init__(self, d=None, st=None):
         self.inc, self.exc = read_scope(d) if d else ([], [])
-        self.aliases = {}
         st = st or {}
+        self.ips_of = {}                    # name -> set of IPs it points at
         for h in st.get("hosts", []):
             for a in h.get("aliases", []):
-                self.aliases.setdefault(a.lower(), h["ip"])
+                self._add(a, h["ip"])
         for n in st.get("names", []):
-            if n.get("ip"):
-                self.aliases.setdefault(n["name"].lower(), n["ip"])
+            self._add(n.get("name"), n.get("ip"))
+        for name, rec in (st.get("dns") or {}).items():
+            for ip in rec.get("ips", []):
+                self._add(name, ip)
         if self.defined:
             for ip, names in etc_hosts():
                 for n in names:
-                    self.aliases.setdefault(n, ip)
+                    self._add(n, ip)
         self.domain = str((st.get("facts") or {}).get("domain", "")).lower()
         extra = [x.strip().lower() for x in str(CFG.get("scope_allow", "")).split(",") if x.strip()]
         self.allow = list(ALWAYS_ALLOW) + extra
+        self.looked_up = {}                 # DNS answers fetched by this object
         self._own = None
+        self._conf = None
+
+    def _add(self, name, ip):
+        if name and ip and _ip_obj(ip) is not None:
+            self.ips_of.setdefault(name.lower().rstrip("."), set()).add(ip)
+
+    def learn(self, name, ips):
+        for ip in ips:
+            self._add(name, ip)
+        self._conf = None
 
     @property
     def defined(self):
         return bool(self.inc or self.exc)
+
+    def has_ip_scope(self, which=None):
+        es = self.inc + self.exc if which is None else which
+        return any(e["kind"] in ("net", "range") for e in es)
 
     def own_ips(self):
         if self._own is None:
@@ -881,46 +895,114 @@ class Scope:
             return path.startswith(e["path"]) if path else None
         return hit
 
+    def listed(self, host, path=""):
+        """'out' / 'in' / None from the scope entries alone (no DNS, no aliases)."""
+        host = (host or "").lower().rstrip(".")
+        ip = _ip_obj(host)
+        if any(self._hit(e, host, ip, path) is True for e in self.exc):
+            return "out"
+        if any(self._hit(e, host, ip, path) is not False for e in self.inc):
+            return "in"
+        return None
+
+    def entry_for(self, host):
+        """The scope line that decides a host (for messages)."""
+        host = host.lower().rstrip(".")
+        ip = _ip_obj(host)
+        for e in (*self.exc, *self.inc):
+            if self._hit(e, host, ip) is not False:
+                return e["raw"]
+        return ""
+
+    def _exact_in(self, ip):
+        return any(e["kind"] == "net" and e["net"].num_addresses == 1 and ip in e["net"] for e in self.inc)
+
+    def conflict_ips(self):
+        """{ip: [out-of-scope names resolving to it]}, for IPs that are in scope only
+        through a range. Listing such an IP on its own under In scope settles it."""
+        if self._conf is None:
+            self._conf = {}
+            for name, ips in self.ips_of.items():
+                if self.listed(name) != "out":
+                    continue
+                for ip in ips:
+                    o = _ip_obj(ip)
+                    if self.listed(ip) == "in" and not self._exact_in(o):
+                        self._conf.setdefault(ip, []).append(name)
+        return self._conf
+
     def verdict(self, host, path=""):
-        """'in' | 'out' | 'unknown' (not listed) | 'self' | 'allow' | 'none' (no scope)."""
+        """'in' | 'out' | 'conflict' | 'unknown' (not listed) | 'self' | 'allow' | 'none'."""
         if not self.defined:
             return "none"
         host = (host or "").lower().rstrip(".")
         ip = _ip_obj(host)
         if host in SELF_NAMES or (ip is not None and (ip.is_loopback or str(ip) in self.own_ips())):
             return "self"
-        if any(self._hit(e, host, ip, path) is True for e in self.exc):
-            return "out"
-        if any(self._hit(e, host, ip, path) is not False for e in self.inc):
-            return "in"
-        if ip is None:
-            via = self.aliases.get(host)
-            if via and via != host:
-                v = self.verdict(via)
-                if v in ("in", "out"):
-                    return v
+        listed = self.listed(host, path)
+        if ip is not None:
+            if listed == "in" and not self._exact_in(ip) and str(ip) in self.conflict_ips():
+                return "conflict"
+            if listed:
+                return listed
+        else:
+            if listed == "out":
+                return "out"
+            via = [self.listed(x) for x in self.ips_of.get(host, ())]
+            if listed == "in":
+                return "conflict" if "out" in via else "in"
+            if "out" in via:
+                return "out"
+            if via and all(v == "in" for v in via):
+                return "in"             # every address it resolves to is in scope
+            if "in" in via:
+                return "conflict"       # partly inside the scope: traffic may go either way
             if self.domain and (host == self.domain or host.endswith("." + self.domain)) \
-                    and any(e["kind"] in ("net", "range") for e in self.inc):
-                return "in"         # the AD/DNS domain of an in-scope lab network
+                    and self.has_ip_scope(self.inc):
+                return "in"             # the AD/DNS domain of an in-scope lab network
         if any(host == a or host.endswith("." + a) for a in self.allow):
             return "allow"
         return "unknown"
 
-    def net_verdict(self, net):
-        """For a whole network named in a command (nmap 10.10.10.0/24)."""
+    def why(self, host):
+        """Why a host got its verdict, when DNS or a conflict decided it."""
+        host = host.lower().rstrip(".")
+        if _ip_obj(host) is not None:
+            names = self.conflict_ips().get(host)
+            return f"out-of-scope {', '.join(sorted(names))} resolves to it" if names else ""
+        ips = sorted(self.ips_of.get(host, ()))
+        outs = [x for x in ips if self.listed(x) == "out"]
+        if outs:
+            return f"resolves to {', '.join(outs)}, out of scope by {self.entry_for(outs[0])}"
+        ins = [x for x in ips if self.listed(x) == "in"]
+        if ins and self.listed(host) is None:
+            rest = [x for x in ips if x not in ins]
+            if rest:
+                return f"resolves to {', '.join(ins)} inside the scope, but also to {', '.join(rest)} outside it"
+            return f"resolves to {', '.join(ins)} in {self.entry_for(ins[0])}"
+        return ""
+
+    def net_conflicts(self, net, excluded=()):
+        return sorted(ip for ip in self.conflict_ips()
+                      if _ip_obj(ip).version == net.version and _ip_obj(ip) in net
+                      and not any(_ip_obj(ip) in x for x in excluded if x.version == net.version))
+
+    def net_verdict(self, net, excluded=()):
+        """For a whole network in a command (nmap 10.10.10.0/24). 'excluded' are the
+        networks the command leaves out (nmap --exclude)."""
         if not self.defined:
             return "none"
         lo, hi = int(net[0]), int(net[-1])
         for e in self.exc:
-            if e["kind"] == "net" and e["net"].version == net.version and net.overlaps(e["net"]):
+            if e["kind"] == "net" and e["net"].version == net.version and net.overlaps(e["net"]) \
+                    and not any(e["net"].subnet_of(x) for x in excluded if x.version == net.version):
                 return "out"
             if e["kind"] == "range" and net.version == 4 and lo <= e["hi"] and hi >= e["lo"]:
                 return "out"
         for e in self.inc:
-            if e["kind"] == "net" and e["net"].version == net.version and net.subnet_of(e["net"]):
-                return "in"
-            if e["kind"] == "range" and net.version == 4 and e["lo"] <= lo and hi <= e["hi"]:
-                return "in"
+            if (e["kind"] == "net" and e["net"].version == net.version and net.subnet_of(e["net"])) or \
+                    (e["kind"] == "range" and net.version == 4 and e["lo"] <= lo and hi <= e["hi"]):
+                return "conflict" if self.net_conflicts(net, excluded) else "in"
         return "unknown"
 
     def covers_subdomains(self, parent):
@@ -928,16 +1010,27 @@ class Scope:
         if any(e["kind"] == "wild" and (parent == e["value"] or parent.endswith("." + e["value"]))
                for e in self.inc):
             return True
-        return parent in self.aliases and self.verdict(parent) == "in"
+        return parent in self.ips_of and self.verdict(parent) == "in"
 
     def out_under(self, parent):
         return [e["raw"] for e in self.exc
                 if e["kind"] in ("host", "wild") and e["value"].endswith("." + parent)]
 
     def knows(self, name):
-        return name in self.aliases or any(
+        return name in self.ips_of or any(
             self._hit(e, name, None) is not False for e in (*self.inc, *self.exc)
             if e["kind"] in ("host", "wild"))
+
+    def lookup(self, names, timeout=2.0):
+        """Resolve names this scope cannot judge yet, and learn the answers."""
+        want = sorted({n for n in names if n and _ip_obj(n) is None and n not in self.ips_of})
+        if not want or not self.has_ip_scope():
+            return {}
+        found = resolve_names(want, timeout)
+        for n, ips in found.items():
+            self.learn(n, ips)
+        self.looked_up.update(found)
+        return found
 
     def summary(self, n=4):
         def short(es):
@@ -945,6 +1038,84 @@ class Scope:
             return ", ".join(vals[:n]) + (f" (+{len(vals) - n})" if len(vals) > n else "")
         s = f"in: {short(self.inc) or '-'}"
         return s + (f"   out: {short(self.exc)}" if self.exc else "")
+
+def resolve_names(names, timeout=3.0, limit=200):
+    """{name: [ip, ...]} from the system resolver (/etc/hosts, then DNS), looked up
+    in parallel. Names that take longer than 'timeout' in total are left out (and
+    tried again later); names that do not resolve map to []."""
+    import socket
+    import threading
+    res, lock, gate = {}, threading.Lock(), threading.Semaphore(24)
+    def one(n):
+        with gate:
+            try:
+                ips = sorted({i[4][0] for i in socket.getaddrinfo(n, None, proto=socket.IPPROTO_TCP)})
+            except (OSError, UnicodeError, ValueError):
+                ips = []
+        with lock:
+            res[n] = ips
+    threads = [threading.Thread(target=one, args=(n,), daemon=True) for n in list(names)[:limit]]
+    for t in threads:
+        t.start()
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    with lock:
+        return dict(res)
+
+def scope_conflicts(scope):
+    """(conflicts, notes): where the scope contradicts itself, directly or through
+    DNS. Out of scope always wins; conflicts are what you should settle with the
+    client or program."""
+    conflicts, notes = [], []
+    for e in scope.inc:
+        for x in scope.exc:
+            covered = False
+            if e["kind"] in ("host", "wild") and x["kind"] in ("host", "wild") and not x.get("path"):
+                covered = (x["kind"] == "host" and e["kind"] == "host" and e["value"] == x["value"]) or \
+                    (x["kind"] == "wild" and (e["value"] == x["value"] or e["value"].endswith("." + x["value"])))
+            elif e["kind"] == "net" and x["kind"] == "net" and e["net"].version == x["net"].version:
+                covered = e["net"].subnet_of(x["net"])
+            elif e["kind"] in ("net", "range") and x["kind"] in ("net", "range"):
+                elo, ehi = (int(e["net"][0]), int(e["net"][-1])) if e["kind"] == "net" else (e["lo"], e["hi"])
+                xlo, xhi = (int(x["net"][0]), int(x["net"][-1])) if x["kind"] == "net" else (x["lo"], x["hi"])
+                covered = xlo <= elo and ehi <= xhi
+            if covered:
+                conflicts.append(f"{e['raw']} is listed in scope, but {x['raw']} is out of scope: "
+                                 f"treated as out of scope.")
+    for ip, names in sorted(scope.conflict_ips().items()):
+        conflicts.append(f"{ip} is in scope through {scope.entry_for(ip)}, but out-of-scope "
+                         f"{', '.join(sorted(names))} resolves to it. Ask before testing it; then list "
+                         f"{ip} under In scope (or Out of scope).")
+    ip_scope = scope.has_ip_scope(scope.inc)
+    for name, ips in sorted(scope.ips_of.items()):
+        if scope.listed(name) is None and scope.verdict(name) == "conflict":
+            ins = sorted(x for x in ips if scope.listed(x) == "in")
+            rest = sorted(x for x in ips if x not in ins)
+            conflicts.append(f"{name} resolves to {', '.join(ins)} inside the scope, but also to "
+                             f"{', '.join(rest)} outside it: requests may go either way. List the "
+                             f"name or those addresses under In scope or Out of scope.")
+        if scope.listed(name) != "in":
+            continue
+        outs = sorted(x for x in ips if scope.listed(x) == "out")
+        if outs:
+            conflicts.append(f"{name} is in scope, but resolves to {', '.join(outs)}, which is out of "
+                             f"scope ({scope.entry_for(outs[0])}): commands on {name} are stopped.")
+        elif ip_scope:
+            elsewhere = sorted(x for x in ips if scope.listed(x) is None)
+            if elsewhere:
+                notes.append(f"{name} resolves to {', '.join(elsewhere)}, outside your IP scope: "
+                             f"test it by name, not by IP.")
+    return conflicts, notes
+
+def resolved_into_scope(scope):
+    """Names that are in scope only because they resolve into the in-scope IPs."""
+    out = []
+    for name, ips in sorted(scope.ips_of.items()):
+        if scope.listed(name) is None and scope.verdict(name) == "in":
+            ins = sorted(x for x in ips if scope.listed(x) == "in")
+            out.append((name, ins, scope.entry_for(ins[0]) if ins else ""))
+    return out
 
 # --- which hosts does a command point at -----------------------------------------
 WRAPPERS = ("sudo", "doas", "env", "time", "nohup", "timeout", "nice", "stdbuf", "command",
@@ -1019,12 +1190,18 @@ def _placeholder(host):
         return rest, True
     return host, False
 
+# Arguments that name hosts a scanner must skip (nmap/masscan --exclude, naabu -eh).
+_EXCLUDE_ARG = re.compile(r"(?:--exclude(?:-hosts?|-ips?)?|-eh|-exclude-hosts)(?:\s+|=)(\S+)")
+_EXCLUDE_FILE = re.compile(r"(?:--excludefile|--exclude-file|-ef)(?:\s+|=)(\S+)")
+
 def hosts_in_command(cmd, cwd=None, scope=None):
     """The hosts a command line points at, as dicts {host, path, net, range,
-    header, placeholder}. Hosts inside a request header (-H 'Host: x') are marked
-    'header': they do not decide where traffic goes."""
+    header, placeholder, excluded}. Hosts inside a request header (-H 'Host: x')
+    are marked 'header' (they do not decide where traffic goes); hosts after
+    --exclude are marked 'excluded'."""
     prog = prog_of(cmd)
     headers = [m.span() for m in _HEADER_ARG.finditer(cmd)]
+    excl = [m.span(1) for m in _EXCLUDE_ARG.finditer(cmd)]
     out, seen = [], set()
     def add(pos, host, **kw):
         key = (host, kw.get("path", ""))
@@ -1032,9 +1209,16 @@ def hosts_in_command(cmd, cwd=None, scope=None):
             return
         seen.add(key)
         e = {"host": host, "path": "", "net": None, "range": None, "placeholder": False,
-             "header": any(a <= pos < b for a, b in headers)}
+             "header": any(a <= pos < b for a, b in headers),
+             "excluded": any(a <= pos < b for a, b in excl)}
         e.update(kw)
         out.append(e)
+    for m in _EXCLUDE_FILE.finditer(cmd):                 # nmap --excludefile list.txt
+        f = Path(os.path.join(cwd or os.getcwd(), m.group(1)))
+        for line in (_read(f).splitlines() if f.is_file() else []):
+            a = parse_asset(line.split("#")[0].strip())
+            if a and a["kind"] == "net":
+                add(-1, a["value"], net=a["net"], excluded=True)
     buf = list(cmd)
     def blank(a, b):
         buf[a:b] = " " * (b - a)
@@ -1087,48 +1271,85 @@ LOCAL_CMDS = frozenset("""
     sha256sum gzip gunzip zip unzip tar 7z xclip xsel
 """.split())
 
-def guard_verdicts(scope, cmd, cwd=None):
-    """[(target, verdict)] for what a command points at, plus advice notes."""
-    res, notes = [], []
-    parts = [p for p in re.split(r"\|\||&&|[|;&\n]", cmd) if p.strip()]
-    hits = []
-    for part in parts:
+def guard_verdicts(scope, cmd, cwd=None, dns=True):
+    """[(target, verdict, why)] for what a command points at, plus advice notes.
+    Names the scope cannot judge yet are looked up in DNS first (when the scope
+    has IPs or ranges), so a name inside an in-scope range is let through."""
+    notes, hits = [], []
+    for part in (p for p in re.split(r"\|\||&&|[|;&\n]", cmd) if p.strip()):
         if prog_of(part) not in LOCAL_CMDS:
             hits += hosts_in_command(part, cwd, scope)
+    excluded = []
     for h in hits:
-        if h["header"]:
+        if h["excluded"]:
+            try:
+                excluded.append(h["net"] if h["net"] is not None else ipaddress.ip_network(h["host"]))
+            except ValueError:
+                pass
+    targets = [h for h in hits if not h["header"] and not h["excluded"]]
+    if dns:
+        scope.lookup([h["host"] for h in targets if h["net"] is None and not h["range"]
+                      and not h["placeholder"] and scope.verdict(h["host"]) in ("unknown", "in")])
+    res = []
+    for h in targets:
+        if h["net"] is not None or h["range"]:
+            nets = [h["net"]] if h["net"] is not None else list(ipaddress.summarize_address_range(
+                ipaddress.ip_address(h["range"][0]), ipaddress.ip_address(h["range"][1])))
+            vs = {scope.net_verdict(n, excluded) for n in nets}
+            v = next((x for x in ("out", "unknown", "conflict") if x in vs), "in" if "in" in vs else "none")
+            conf = sorted({ip for n in nets for ip in scope.net_conflicts(n, excluded)})
+            why = ""
+            if v == "conflict":
+                why = (f"contains {', '.join(conf)}, where out-of-scope "
+                       f"{', '.join(sorted({x for ip in conf for x in scope.conflict_ips()[ip]}))} resolves"
+                       f" - leave it out: --exclude {','.join(conf)}")
+            res.append((h["host"], v, why))
             continue
-        if h["net"] is not None:
-            v = scope.net_verdict(h["net"])
-        elif h["range"]:
-            lo, hi = h["range"]
-            v = scope.net_verdict(ipaddress.ip_network(str(ipaddress.ip_address(lo)))) if lo == hi \
-                else _range_verdict(scope, lo, hi)
-        else:
-            v = scope.verdict(h["host"], h["path"])
-            if h["placeholder"]:
-                if v != "out" and scope.covers_subdomains(h["host"]):
-                    v = "in"
-                outs = scope.out_under(h["host"])
-                if outs:
-                    notes.append(f"{', '.join(outs)} is out of scope: keep it out of your wordlist")
-                res.append((f"FUZZ.{h['host']}", v))
-                continue
-        res.append((h["host"], v))
+        v = scope.verdict(h["host"], h["path"])
+        if h["placeholder"]:
+            if v != "out" and scope.covers_subdomains(h["host"]):
+                v = "in"
+            outs = scope.out_under(h["host"])
+            if outs:
+                notes.append(f"{', '.join(outs)} is out of scope: keep it out of your wordlist")
+            res.append((f"FUZZ.{h['host']}", v, ""))
+            continue
+        res.append((h["host"], v, scope.why(h["host"])))
     return res, notes
 
-def _range_verdict(scope, lo, hi):
-    # a range is in scope when every network in it is
-    nets = ipaddress.summarize_address_range(ipaddress.ip_address(lo), ipaddress.ip_address(hi))
-    vs = {scope.net_verdict(n) for n in nets}
-    return "out" if "out" in vs else ("in" if vs == {"in"} else "unknown")
+def _save_lookups(d, st, scope):
+    """Keep DNS answers the guard fetched, so the next check does not ask again."""
+    if scope.looked_up:
+        for n, ips in scope.looked_up.items():
+            st["dns"][n] = {"ips": ips, "ts": _now()}
+        save_state(d, st)
+
+GUARD_TEXT = {"strict": "stops commands aimed outside the scope",
+              "warn": "reports commands aimed outside the scope, does not stop them",
+              "off": "does not check commands"}
+
+def _live_capture():
+    """The marker of the capture this shell runs in, if any."""
+    if not os.environ.get("PENTRAIL_CAPTURE"):
+        return None
+    m = _read_marker()
+    return m if m and process_alive(m.get("pid")) else None
+
+def guard_mode():
+    """The scope guard in effect: the running capture's own mode ('capture --warn',
+    or 'scope guard' typed inside it), else the setting (config scope_guard)."""
+    m = _live_capture()
+    if m and m.get("guard") in GUARD_MODES:
+        return m["guard"]
+    mode = CFG.get("scope_guard", "strict")
+    return mode if mode in GUARD_MODES else "strict"
 
 def scope_gate(d, st, line, values=None, cwd=None):
     """Apply the scope guard to a command line. Returns (allowed, message lines).
     Used by the capture shell before each command and by 'shot' before it runs one.
     Blocks and overrides go to the logbook, so you have the trail if asked."""
     scope = Scope(d, st)
-    mode = CFG.get("scope_guard", "strict")
+    mode = guard_mode()
     if not scope.defined or mode == "off":
         return True, []
     stripped = line.strip()
@@ -1139,21 +1360,25 @@ def scope_gate(d, st, line, values=None, cwd=None):
     env.update(values or {})
     expanded = expand_vars(stripped, env)
     res, notes = guard_verdicts(scope, expanded, cwd)
+    _save_lookups(d, st, scope)
     msgs = [f"note: {n}" for n in notes]
-    bad = [(t, v) for t, v in res if v in ("out", "unknown")]
+    msgs += [f"{t}: {why}" for t, v, why in res if why and v == "in"]
+    bad = [(t, v, why) for t, v, why in res if v in ("out", "unknown", "conflict")]
     if not bad:
         return True, msgs
-    what = ", ".join(f"{t} ({'OUT of scope' if v == 'out' else 'not in scope'})" for t, v in bad)
+    what = ", ".join(f"{t} ({VERDICT_TEXT[v]}{': ' + why if why else ''})" for t, v, why in bad)
     if override:
         log_event("scope", f"override: {expanded}  [{what}]", d)
         return True, msgs + [f"scope override for {what}: logged"]
-    if mode == "warn":
-        return True, msgs + [f"WARNING: {what}. Check 0-scope/scope.md."]
+    if mode == "warn":                    # informative: say it, log it, let it run
+        log_event("scope", f"warned: {expanded}  [{what}]", d)
+        return True, msgs + [f"out of scope (guard warn, running it): {what}. Logged."]
     log_event("scope", f"blocked: {expanded}  [{what}]", d)
-    return False, msgs + [f"BLOCKED: {what}. Not run.",
-                          f"  scope -> {scope.summary()}",
-                          "  belongs in scope?  pentrail scope add <host>     "
-                          "run once anyway:  scope-ok <command>"]
+    hint = ("  a conflict: ask the client or program, then list the IP under In scope or Out of scope"
+            if any(v == "conflict" for _, v, _ in bad) else
+            "  belongs in scope?  pentrail scope add <host>")
+    return False, msgs + [f"BLOCKED: {what}. Not run.", f"  scope -> {scope.summary()}",
+                          hint + "     run once anyway:  scope-ok <command>"]
 
 def scope_append(d, which, values):
     """Add assets under '## In scope' or '## Out of scope' in scope.md. Returns
@@ -1183,9 +1408,27 @@ def scope_append(d, which, values):
     f.write_text("\n".join(lines) + "\n")
     return added
 
-VERDICT_TEXT = {"in": f"in scope", "out": "OUT of scope", "unknown": "not in scope",
-                "self": "your own machine", "allow": "tooling host (never a target)",
-                "none": "no scope set"}
+VERDICT_TEXT = {"in": "in scope", "out": "OUT of scope", "unknown": "not in scope",
+                "conflict": "CONFLICT", "self": "your own machine",
+                "allow": "tooling host (never a target)", "none": "no scope set"}
+
+def resolve_all(d, st, scope=None, timeout=5.0):
+    """Look up every name pentrail knows (found names, hostnames in the scope, host
+    entries) and store the answers. Hosts get the names that point at them as
+    aliases. Returns {name: [ips]}."""
+    scope = scope or Scope(d, st)
+    names = {n["name"] for n in st["names"]} | set(st["dns"]) | \
+        {e["value"] for e in scope.inc + scope.exc if e["kind"] == "host"} | \
+        {h["ip"] for h in st["hosts"] if _ip_obj(h["ip"]) is None}
+    found = resolve_names(sorted(names), timeout, limit=1000)
+    for n, ips in found.items():
+        st["dns"][n] = {"ips": ips, "ts": _now()}
+        scope.learn(n, ips)
+        for ip in ips:
+            h = _find_host(st, ip)
+            if h and n != h["ip"] and n not in h["aliases"]:
+                h["aliases"].append(n)
+    return found
 
 def cmd_scope(args):
     d = require_engagement()
@@ -1202,40 +1445,75 @@ def cmd_scope(args):
         if added:
             log_event("scope", f"{'in' if which == 'in' else 'out of'} scope: {', '.join(added)}")
             ok(f"{'In' if which == 'in' else 'Out of'} scope: {', '.join(added)}  ({SCOPE_DOC})")
+            scope = Scope(d, st)                 # where do the new names point?
+            names = [a["value"] for a in map(parse_asset, added) if a["kind"] == "host"]
+            for nm, ips in resolve_names(names, timeout=3.0).items() if scope.has_ip_scope() else ():
+                st["dns"][nm] = {"ips": ips, "ts": _now()}
+                scope.learn(nm, ips)
+            save_state(d, st)                    # refresh the resolved/conflict blocks
+            for c in scope_conflicts(scope)[0]:
+                warn(c)
         else:
             info("Already listed.")
         return
     if act == "check":
         if not rest:
-            die("Usage: pentrail scope check <host|url|command ...>")
+            die("Usage: pentrail scope check <host|url ...>")
         scope = Scope(d, st)
         if not scope.defined:
             info(f"No scope set yet ({SCOPE_DOC}): nothing is blocked.")
             return
         res, notes = guard_verdicts(scope, " ".join(rest), os.getcwd())
+        _save_lookups(d, st, scope)
         if not res:
             info("No host, IP or URL found in that.")
-        for t, v in res:
-            col = {"in": G, "out": R, "unknown": Y}.get(v, DIM)
-            print(f"  {col}{VERDICT_TEXT[v]:<16}{N} {t}")
+        for t, v, why in res:
+            col = {"in": G, "out": R, "unknown": Y, "conflict": R}.get(v, DIM)
+            print(f"  {col}{VERDICT_TEXT[v]:<16}{N} {t}" + (f"  {DIM}{why}{N}" if why else ""))
         for n in notes:
             print(f"  {DIM}note: {n}{N}")
         return
+    if act == "resolve":
+        scope = Scope(d, st)
+        if not scope.defined:
+            info(f"No scope set yet ({SCOPE_DOC})."); return
+        found = resolve_all(d, st, scope)
+        save_state(d, st)
+        for n, ips in sorted(found.items()):
+            v = scope.verdict(n)
+            col = {"in": G, "out": R, "unknown": Y, "conflict": R}.get(v, DIM)
+            print(f"  {col}{VERDICT_TEXT[v]:<16}{N} {n:<36} {', '.join(ips) or DIM + 'no answer' + N}")
+        info(f"{len(found)} name(s) looked up; answers kept in state.json, see {SCOPE_DOC}")
+        _print_conflicts(scope)
+        return
     if act == "guard":
+        live = _live_capture()
         if not rest:
-            info(f"Scope guard: {CFG.get('scope_guard', 'strict')}  (strict | warn | off)")
+            info(f"Scope guard: {guard_mode()} - {GUARD_TEXT[guard_mode()]}"
+                 + (" (this capture)" if live and live.get("guard") else ""))
+            print(f"    setting: {CFG.get('scope_guard', 'strict')}   modes: strict | warn | off")
             return
         mode = rest[0].lower()
         if mode not in GUARD_MODES:
             die("Usage: pentrail scope guard strict|warn|off")
-        set_config("scope_guard", mode)
-        log_event("scope", f"guard -> {mode}")
-        ok(f"Scope guard: {mode}")
+        if live:                              # inside a capture: this capture only, right away
+            live["guard"] = mode
+            _write_marker(live)
+            log_event("scope", f"guard -> {mode} (capture {live.get('label')})")
+            ok(f"Scope guard for this capture: {mode} - {GUARD_TEXT[mode]}")
+            print(f"    {DIM}the setting stays {CFG.get('scope_guard', 'strict')} "
+                  f"('pentrail config scope_guard {mode}' to keep it){N}")
+        else:
+            set_config("scope_guard", mode)
+            log_event("scope", f"guard -> {mode}")
+            ok(f"Scope guard: {mode} - {GUARD_TEXT[mode]}  (setting, used by every capture)")
         return
     if act != "show":
-        die("Usage: pentrail scope [add|out|check|guard] ...")
+        die("Usage: pentrail scope [add|out|check|resolve|guard] ...")
     scope = Scope(d, st)
-    print(f"{B}Scope{N} ({SCOPE_DOC})   guard: {CFG.get('scope_guard', 'strict')}")
+    live = _live_capture()
+    print(f"{B}Scope{N} ({SCOPE_DOC})   guard: {guard_mode()}"
+          + (" (this capture)" if live and live.get("guard") else ""))
     if not scope.defined:
         info("No scope set yet: nothing is blocked and everything parsed is logged.")
         print(f"    add assets with 'pentrail scope add <ip|range|domain|*.domain|url>' "
@@ -1245,6 +1523,25 @@ def cmd_scope(args):
         print(f"  {G}in {N}  {e['raw']}")
     for e in scope.exc:
         print(f"  {R}out{N}  {e['raw']}")
+    res = resolved_into_scope(scope)
+    if res:
+        print(f"\n{B}Resolved into the scope{N} ({len(res)})")
+        for name, ips, entry in res[:15]:
+            print(f"  {G}in {N}  {name:<36} {DIM}-> {', '.join(ips)} ({entry}){N}")
+        if len(res) > 15:
+            print(f"  {DIM}... {len(res) - 15} more in {SCOPE_DOC}{N}")
+    _print_conflicts(scope)
+
+def _print_conflicts(scope):
+    conflicts, notes = scope_conflicts(scope)
+    if conflicts:
+        print(f"\n{R}Conflicts{N} ({len(conflicts)}) - out of scope wins until you settle them:")
+        for c in conflicts:
+            print(f"  {R}!{N} {c}")
+    if notes:
+        print(f"\n{DIM}Notes:{N}")
+        for x in notes[:10]:
+            print(f"  {DIM}- {x}{N}")
 
 # ----------------------------------------------------------------------------- project: new / use / resume / list
 def _target_of(a):
@@ -1341,7 +1638,7 @@ def project_summary(d, loglines=6):
     info(f"Project {B}{d.name}{N}   target: {st.get('target') or '-'}   phase: {st.get('phase')}"
          + (f"   domain: {dom}" if dom else ""))
     sc = Scope(d, st)
-    print(f"    scope  : {sc.summary() if sc.defined else Y + 'not set' + N + ' (pentrail scope add ...)'}")
+    print(f"    scope  : {sc.summary() + '   guard: ' + guard_mode() if sc.defined else Y + 'not set' + N + ' (pentrail scope add ...)'}")
     if st.get("focus"):
         print(f"    focus  : {Y}{st['focus']}{N}")
     if st["hosts"]:
@@ -1438,6 +1735,7 @@ def cmd_docs(args):
         print(f"  {p:<9} {rel(d, f)}")
     fs = list_findings(d)
     print(f"  findings  5-report/findings/ ({len(fs)})")
+    print(f"  notes     {NOTES_DOC} ({len(st['notes'])})")
     print(f"  logbook   logbook.md")
 
 # ----------------------------------------------------------------------------- hosts & lateral movement
@@ -1445,6 +1743,14 @@ def _find_host(st, key):
     k = (key or "").lower()
     return next((h for h in st["hosts"] if h["ip"].lower() == k or (h.get("name") or "").lower() == k
                  or k in [a.lower() for a in h.get("aliases", [])]), None)
+
+def _keys(h):
+    return {h["ip"], *h.get("aliases", [])}
+
+def _canon(st, addr):
+    """The tracked host an address or name belongs to (its 'ip'), else the address."""
+    h = _find_host(st, addr) if addr else None
+    return h["ip"] if h else addr
 
 def _ensure_host(st, addr, name=""):
     h = _find_host(st, addr)
@@ -1491,18 +1797,25 @@ def show_host(d, st, h):
         for p in sorted(h["ports"], key=lambda p: p["port"]):
             print(f"    {G}{p['port']:>5}/{p['proto']}{N} {p['service']:<14} {p.get('version', '')}"
                   f"  {DIM}{src_str(st, p.get('by'))}{N}")
-    web = [w for w in st["web"] if w["host"] == h["ip"]]
+    web = [w for w in st["web"] if w["host"] in _keys(h)]
     if web:
         print(f"\n  {B}Web{N} ({len(web)})")
         for w in web[:40]:
             print(f"    {w.get('status') or '   '} {w['url']}  {DIM}{w.get('note', '')}{N}")
         if len(web) > 40:
             print(f"    {DIM}... {len(web) - 40} more in 1-enum/enum.md{N}")
-    vs = [v for v in st["vectors"] if v.get("host") == h["ip"]]
+    vs = [v for v in st["vectors"] if v.get("host") in _keys(h)]
     if vs:
         print(f"\n  {B}Leads{N}")
         for v in vs:
             print(f"    #{v['id']:<3} {STATUS_COL.get(v['status'], '')}{v['status']:<8}{N} [{v.get('type')}] {v['desc']}")
+    L = _note_links(d, st)
+    ns = [n for n in st["notes"] if n.get("host") == h["ip"] or h["ip"] in _mentions(n, L)]
+    if ns:
+        print(f"\n  {B}Notes{N}")
+        for n in ns:
+            print(f"    N{n['id']:<3} {DIM}{n['ts'][5:16]}{N} {n['text']}"
+                  + (f" {DIM}(on {n.get('host') or 'project'}){N}" if n.get("host") != h["ip"] else ""))
 
 def cmd_hosts(args):
     d = require_engagement()
@@ -2199,7 +2512,7 @@ def _cmd_context(cmd, scope):
             if h["header"] or h["net"] is not None or h["range"]:
                 continue
             v = scope.verdict(h["host"]) if not h["placeholder"] else "in"
-            if v in ("in", "none") and h["host"] not in hosts and not h["placeholder"]:
+            if v in ("in", "none", "conflict") and h["host"] not in hosts and not h["placeholder"]:
                 hosts.append(h["host"])
     url = None
     m = URL_ANY.search(cmd or "")
@@ -2394,7 +2707,7 @@ def src_str(st, cid, width=70):
 def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
     """Merge one command's findings into state. Only what is in scope is kept; every
     item remembers the command that found it. Counts go into 'n'."""
-    default = ctx["hosts"][0] if ctx["hosts"] else (st.get("target") or "")
+    default = _canon(st, ctx["hosts"][0]) if ctx["hosts"] else (st.get("target") or "")
     cid = None
     def by():
         nonlocal cid
@@ -2405,7 +2718,7 @@ def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
         if not host:
             return False
         v = scope.verdict(host)
-        if v in ("in", "none"):
+        if v in ("in", "none", "conflict"):
             return True
         if v in ("out", "unknown"):
             n["skipped"] += 1
@@ -2422,7 +2735,7 @@ def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
         addr = addr or default
         if not keep(addr):
             continue
-        h = _ensure_host(st, addr)
+        h = _ensure_host(st, _canon(st, addr))
         p = next((x for x in h["ports"] if x["port"] == port and x["proto"] == proto), None)
         if not p:
             h["ports"].append({"port": port, "proto": proto, "service": svc or "", "version": ver,
@@ -2430,19 +2743,35 @@ def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
             n["ports"] += 1
         elif ver and len(ver) > len(p.get("version", "")):
             p.update({"service": svc or p["service"], "version": ver, "by": by()})
+    names = []
     for name, ip in F["names"]:
         name = name.strip(".").lower()
         if not BARE_NAME.match(name) or name.rsplit(".", 1)[-1] in FILE_EXTS:
             continue
         ip = ip if ip and _ip_obj(ip) else None
+        if ip:
+            scope.learn(name, [ip])
+        names.append((name, ip))
+    # a name the scope cannot place yet may resolve into an in-scope range: ask DNS
+    # before deciding (only when the scope has IPs or ranges)
+    known = {x["name"] for x in st["names"]}
+    for nm, ips in scope.lookup([nm for nm, ip in names if not ip and nm not in known
+                                 and scope.verdict(nm) in ("unknown", "in")][:150], timeout=3.0).items():
+        st["dns"][nm] = {"ips": ips, "ts": _now()}
+    for name, ip in names:
         v = scope.verdict(name)
         if v == "none" and not (name.endswith(LAB_TLDS) or ctx["prog"] in SUBDOMAIN_TOOLS
                                 or (scope.domain and name.endswith(scope.domain))):
             continue
-        if v not in ("in", "none") and not (ip and scope.verdict(ip) == "in"):
+        if v not in ("in", "none", "conflict"):
             if v in ("out", "unknown"):
                 n["skipped"] += 1
+            if v == "out" and scope.ips_of.get(name):
+                # not a finding, but where an out-of-scope name points matters:
+                # inside an in-scope range it makes that IP a conflict
+                st["dns"][name] = {"ips": sorted(scope.ips_of[name]), "ts": _now()}
             continue
+        ip = ip or next(iter(sorted(scope.ips_of.get(name, ()))), None)
         e = next((x for x in st["names"] if x["name"] == name), None)
         if not e:
             st["names"].append({"name": name, "ip": ip or "", "by": by(), "added": _now()})
@@ -2458,7 +2787,7 @@ def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
         if not keep(host):
             continue
         url = _norm_url(url) if "://" in url else url
-        _ensure_host(st, host)
+        host = _ensure_host(st, host)["ip"]
         w = next((x for x in st["web"] if x["host"] == host and x["url"] == url), None)
         if w:
             if status and not w.get("status"):
@@ -2475,7 +2804,7 @@ def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
                           url=url, excerpt=f"{status or ''} {url}"):
                 n["vectors"] += 1
     for addr, vtype, desc, sig, excerpt, status, sev in F["vulns"]:
-        host = addr or default
+        host = _canon(st, addr) if addr else default
         if not keep(host):
             continue
         if add_vector(d, st, desc, host=host, status=status, sig=f"{sig}:{host}", ptype=vtype,
@@ -2881,8 +3210,12 @@ def cmd_capture(args):
     extra, env, hooked = capture_shell(env, getattr(args, "plain", False))
     scope = Scope(d, st)
     info(f"Recording '{lbl}' (phase {phase}) to {rel(d, f)}")
+    guard = getattr(args, "guard", None) or guard_mode()
     if hooked and scope.defined:
-        print(f"    scope guard {CFG.get('scope_guard')}: {scope.summary()}")
+        print(f"    scope guard {guard}: {GUARD_TEXT[guard]}"
+              + (" (this capture)" if getattr(args, "guard", None) else ""))
+        print(f"    {scope.summary()}")
+        print(f"    {DIM}switch while you work: pentrail scope guard strict|warn|off{N}")
     elif hooked:
         print(f"    {Y}no scope set{N}: nothing is blocked (pentrail scope add <host>)")
     else:
@@ -2896,7 +3229,7 @@ def cmd_capture(args):
     sys.stdout.flush()
     proc = subprocess.Popen(["script", "-q", "-f", *extra, str(f)], env=env)
     _write_marker({"pid": proc.pid, "label": lbl, "file": str(f), "eng": str(d),
-                   "phase": phase, "parsed": 0})
+                   "phase": phase, "parsed": 0, "guard": getattr(args, "guard", None)})
     proc.wait()
     m2 = _read_marker() or {}
     start = int(m2.get("parsed", 0)) if m2.get("pid") == proc.pid else 0
@@ -3055,6 +3388,20 @@ SCOPE_TEMPLATE = """# Scope - {name}
 - Test accounts:
 - Not allowed:
 - Contact:
+{derived}"""
+
+SCOPE_DERIVED = """
+## Resolved into the scope
+<!-- Names that point into your in-scope IPs or ranges, found by captures and by
+     'pentrail scope resolve'. Not wanted? List the name under Out of scope. -->
+<!-- pentrail:auto resolved -->
+<!-- pentrail:end resolved -->
+
+## Scope conflicts
+<!-- Where the scope contradicts itself, directly or through DNS. Out of scope wins
+     until you settle it with the client or program. -->
+<!-- pentrail:auto conflicts -->
+<!-- pentrail:end conflicts -->
 """
 
 ENUM_TEMPLATE = """# Enumeration - {name}
@@ -3093,6 +3440,9 @@ HOST_SECTION = """## {title}
 
 ### Checklist
 {checklist}
+
+### Logged notes
+{notes}
 
 ### Notes
 
@@ -3208,7 +3558,7 @@ def ensure_docs(d, scope_assets=()):
     name = d.name
     make = {
         "scope": lambda: SCOPE_TEMPLATE.format(
-            name=name, in_lines="".join(f"- {a}\n" for a in scope_assets)),
+            name=name, in_lines="".join(f"- {a}\n" for a in scope_assets), derived=SCOPE_DERIVED),
         "enum": lambda: ENUM_TEMPLATE.format(
             name=name, note=AUTO_NOTE, overview=_auto("overview"), names=_auto("names"),
             commands=_auto("commands enum")),
@@ -3227,6 +3577,18 @@ def ensure_docs(d, scope_assets=()):
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(fn())
     (d / "5-report" / "findings").mkdir(parents=True, exist_ok=True)
+    if not (d / NOTES_DOC).exists():
+        (d / NOTES_DOC).write_text(NOTES_TEMPLATE.format(name=name))
+
+def _add_notes_block(text, addr):
+    """Give a host section made before notes existed its 'Logged notes' block, just
+    above its own Notes heading (nothing of yours moves)."""
+    start = text.find(f"<!-- pentrail:host {addr} -->")
+    nxt = text.find("\n## ", start)
+    end = nxt if nxt >= 0 else len(text)
+    at = text.find("\n### Notes", start, end)
+    at = at + 1 if at >= 0 else end
+    return text[:at] + "### Logged notes\n" + _auto(f"notes {addr}") + "\n\n" + text[at:]
 
 def _write_if_changed(f, old, new):
     if new != old:
@@ -3251,7 +3613,9 @@ def render_ports(st, h):
     return "\n".join(rows)
 
 def render_web(st, host):
-    ws = sorted((w for w in st["web"] if w["host"] == host), key=lambda w: w["url"])
+    h = _find_host(st, host)
+    keys = _keys(h) if h else {host}
+    ws = sorted((w for w in st["web"] if w["host"] in keys), key=lambda w: w["url"])
     if not ws:
         return "_none yet_"
     return "\n".join(f"- `{w.get('status') or '-'}` {w['url']}" + (f" - {w['note']}" if w.get("note") else "")
@@ -3262,7 +3626,9 @@ def render_host_names(st, h):
     return "\n".join(f"- {n}" for n in names) if names else "_none yet_"
 
 def render_leads(st, host):
-    vs = sorted((v for v in st["vectors"] if v.get("host") == host),
+    h = _find_host(st, host)
+    keys = _keys(h) if h else {host}
+    vs = sorted((v for v in st["vectors"] if v.get("host") in keys),
                 key=lambda v: (STATUS_ORDER.get(v["status"], 1), v["id"]))
     if not vs:
         return "_none yet_"
@@ -3284,8 +3650,8 @@ def render_overview(st):
         return "_no hosts yet: run a scan inside 'pentrail capture'_"
     rows = ["| Host | Name | OS | Open ports | Web | Leads | Owned |", "|---|---|---|---|---|---|---|"]
     for h in st["hosts"]:
-        web = sum(1 for w in st["web"] if w["host"] == h["ip"])
-        leads = sum(1 for v in st["vectors"] if v.get("host") == h["ip"] and v["status"] in ("open", "working"))
+        web = sum(1 for w in st["web"] if w["host"] in _keys(h))
+        leads = sum(1 for v in st["vectors"] if v.get("host") in _keys(h) and v["status"] in ("open", "working"))
         rows.append(f"| {h['ip']} | {_cell(h.get('name'))} | {_cell(h.get('os'))} | {_cell(_ports_short(h, 8))} "
                     f"| {web} | {leads} | {'yes' if h['owned'] else ''} |")
     return "\n".join(rows)
@@ -3320,6 +3686,22 @@ def render_evidence(d, phase):
         out.append(f"- ![{f.name}]({r})" if f.suffix == ".png" else f"- [{f.name}]({r})")
     return "\n".join(out)
 
+def render_resolved(scope, st):
+    rows = resolved_into_scope(scope)
+    if not rows:
+        return "_none yet_"
+    by = {n["name"]: n.get("by") for n in st["names"]}
+    return "\n".join(f"- {name} -> {', '.join(ips)} (in {entry})"
+                     + (f" <sub>{_src_md(st, by[name])}</sub>" if by.get(name) else "")
+                     for name, ips, entry in rows)
+
+def render_conflicts(scope):
+    conflicts, notes = scope_conflicts(scope)
+    if not conflicts and not notes:
+        return "_none_"
+    out = [f"- **{c}**" for c in conflicts] + [f"- {x}" for x in notes[:30]]
+    return "\n".join(out + ([f"- ... {len(notes) - 30} more"] if len(notes) > 30 else []))
+
 def render_chain(d):
     lines = [l for l in _read(d / "logbook.md").splitlines() if "`pivot" in l]
     out = []
@@ -3328,6 +3710,201 @@ def render_chain(d):
         out.append(f"- {l[2:18]}  {m.group(1) if m else ''}")
     return "\n".join(out) if out else "_none yet: 'pentrail pivot <from> <to> --via <how>'_"
 
+# ----------------------------------------------------------------------------- notes
+# Quick notes from the terminal, tied to a host (the active box unless you say
+# otherwise). They show in notes.md, grouped by host, and in the host's section of
+# enum.md. Hosts, leads (#3), findings (F01) and other notes (N2) that a note
+# mentions become links, and every host lists the notes that mention it.
+NOTES_DOC = "notes.md"
+NOTES_TEMPLATE = """# Notes - {name}
+
+<!-- Quick notes from the terminal: pentrail note "<text>" goes on the active box,
+     pentrail note -t <host> "<text>" on another one. Hosts, leads (#3), findings (F01)
+     and other notes (N2) you mention become links. Your own notes go at the bottom. -->
+
+## By host
+<!-- pentrail:auto notes-by-host -->
+<!-- pentrail:end notes-by-host -->
+
+## Not tied to a host
+<!-- pentrail:auto notes-general -->
+<!-- pentrail:end notes-general -->
+
+## Your notes
+
+"""
+
+def gh_slug(text):
+    """The anchor GitHub, VS Code and pentrail's HTML export give a heading."""
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)       # a link counts as its text
+    return re.sub(r"[^\w\- ]", "", text.strip().lower()).replace(" ", "-")
+
+def _linkable_name(name):
+    # host names like 'box1' or 'dc01.corp.local' are safe to link; 'web' is not
+    return bool(name) and len(name) >= 3 and bool(re.search(r"[\d.]", name))
+
+def _host_title(h):
+    return h["ip"] + (f" ({h['name']})" if h.get("name") else "")
+
+def _note_links(d, st, enum_text=None):
+    """Everything a note can point at, for link_note()."""
+    text = enum_text if enum_text is not None else _read(phase_dir(d, "enum") / DOC_FILES["enum"])
+    anchors, last = {}, ""
+    for line in text.splitlines():
+        if line.startswith("## "):
+            last = line[3:]
+        m = re.match(r"<!-- pentrail:host (\S+) -->", line)
+        if m:
+            anchors[m.group(1)] = gh_slug(last)
+    keys = {}
+    for h in st["hosts"]:
+        for k in [h["ip"], *h.get("aliases", []), *([h["name"]] if _linkable_name(h.get("name")) else [])]:
+            keys.setdefault(k.lower(), h["ip"])
+    return {"keys": keys, "anchors": anchors, "hosts": {h["ip"]: h for h in st["hosts"]},
+            "findings": {x["id"].upper(): rel(d, x["path"]) for x in list_findings(d)},
+            "vectors": {v["id"]: v.get("host", "") for v in st["vectors"]},
+            "notes": {n["id"]: n.get("host", "") for n in st["notes"]}}
+
+def _notes_anchor(L, host):
+    h = L["hosts"].get(host)
+    return gh_slug(_host_title(h)) if h else "not-tied-to-a-host"
+
+def _mention_re(L):
+    keys = sorted(L["keys"], key=len, reverse=True)
+    hosts = "|".join(re.escape(k) for k in keys) or r"(?!x)x"
+    return re.compile(r"(?P<f>\bF\d{2,}\b)|(?<![\w#&])#(?P<v>\d+)\b|\bN(?P<n>\d+)\b"
+                      r"|(?<![\w.\-/])(?i:(?P<h>" + hosts + r"))(?![\w\-]|\.\w)")
+
+def _mentions(n, L):
+    """The hosts a note's text names."""
+    return {L["keys"][m.group("h").lower()] for m in _mention_re(L).finditer(n["text"]) if m.group("h")}
+
+def link_note(text, L, base=""):
+    """Note text with hosts, leads, findings and notes as Markdown links, relative
+    to a doc in folder 'base' ('' = the project folder, '1-enum' = enum.md)."""
+    up = "../" if base else ""
+    enum = "" if base == "1-enum" else f"{up}1-enum/enum.md"
+    notes = f"{up}{NOTES_DOC}" if base else ""
+    def host(addr, label):
+        anc = L["anchors"].get(L["keys"].get((addr or "").lower(), addr))   # a name -> its host
+        return f"[{label}]({enum}#{anc})" if anc else label
+    def sub(m):
+        if m.group("f"):
+            p = L["findings"].get(m.group("f").upper())
+            return f"[{m.group('f')}]({up}{p})" if p else m.group(0)
+        if m.group("v"):
+            vid = int(m.group("v"))
+            return host(L["vectors"][vid], f"#{vid}") if vid in L["vectors"] else m.group(0)
+        if m.group("n"):
+            nid = int(m.group("n"))
+            return f"[N{nid}]({notes}#{_notes_anchor(L, L['notes'][nid])})" if nid in L["notes"] else m.group(0)
+        return host(L["keys"][m.group("h").lower()], m.group("h"))
+    parts = text.split("`")
+    for i in range(0, len(parts), 2):            # leave `code` alone
+        parts[i] = _mention_re(L).sub(sub, parts[i])
+    return "`".join(parts)
+
+def note_line(st, n, L, base=""):
+    c = next((c for c in st["commands"] if c["id"] == n.get("by")), None) if n.get("by") else None
+    after = f" <sub>after `{c['cmd'][:80].replace('`', chr(39))}`</sub>" if c else ""
+    return f"- **N{n['id']}** {n['ts'][:16]} · {n.get('phase', '')} · {link_note(n['text'], L, base)}{after}"
+
+def render_notes_by_host(st, L):
+    out = []
+    for h in st["hosts"]:
+        own = [n for n in st["notes"] if n.get("host") == h["ip"]]
+        men = [n for n in st["notes"] if n.get("host") != h["ip"] and h["ip"] in _mentions(n, L)]
+        if not own and not men:
+            continue
+        anc = L["anchors"].get(h["ip"])
+        out.append(f"### [{_host_title(h)}](1-enum/enum.md#{anc})" if anc else f"### {_host_title(h)}")
+        out += [note_line(st, n, L) for n in own]
+        if men:
+            out.append("- _mentioned in_ " + ", ".join(
+                f"[N{n['id']}](#{_notes_anchor(L, n.get('host'))})" for n in men))
+        out.append("")
+    return "\n".join(out).strip() or '_no notes yet: pentrail note "<text>"_'
+
+def render_notes_general(st, L):
+    ns = [n for n in st["notes"] if n.get("host") not in L["hosts"]]
+    return "\n".join(note_line(st, n, L) + (f" _(was on {n['host']})_" if n.get("host") else "")
+                     for n in ns) or "_none_"
+
+def render_host_notes(st, h, L):
+    own = [n for n in st["notes"] if n.get("host") == h["ip"]]
+    men = [n for n in st["notes"] if n.get("host") != h["ip"] and h["ip"] in _mentions(n, L)]
+    lines = [note_line(st, n, L, "1-enum") for n in own]
+    if men:
+        lines.append("- _mentioned in_ " + ", ".join(
+            f"[N{n['id']}](../{NOTES_DOC}#{_notes_anchor(L, n.get('host'))})" for n in men))
+    return "\n".join(lines) or '_none yet: pentrail note "<text>"_'
+
+def cmd_note(args):
+    """A quick note on the active box (or -t <host>, or -t none for the project)."""
+    d = require_engagement()
+    st = load_state(d)
+    text = " ".join(args.text).strip()
+    host = st.get("target", "")
+    if args.target:
+        if args.target.lower() in ("-", "none", "general", "project"):
+            host = ""
+        else:
+            h = _find_host(st, args.target)
+            if not h:
+                die(f"Unknown host {args.target} (see 'pentrail hosts'); -t none for a project note")
+            host = h["ip"]
+    m = _live_capture()
+    cap = [c for c in st["commands"] if m and c.get("file") == rel(d, Path(m["file"]))]
+    nid = max([n["id"] for n in st["notes"]] + [st.get("note_seq", 0)]) + 1   # never reuse a number
+    st["note_seq"] = nid
+    st["notes"].append({"id": nid, "text": text, "host": host, "phase": st.get("phase", "enum"),
+                        "ts": _now(), "by": cap[-1]["id"] if cap else None})
+    save_state(d, st)
+    log_event("note", f"N{nid}" + (f" [{host}]" if host else "") + f" {text}")
+    ok(f"Note N{nid}" + (f" on {host}" if host else " (project)") + f" -> {NOTES_DOC}"
+       + (", 1-enum/enum.md" if host else ""))
+
+def cmd_notes(args):
+    """List notes (all, or for one host), remove one, or change its text."""
+    d = require_engagement()
+    st = load_state(d)
+    words = list(args.rest or [])
+    if words and words[0].lower() in ("rm", "del", "remove", "edit"):
+        act = words[0].lower()
+        nid = int(re.sub(r"^[Nn]", "", words[1])) if len(words) > 1 and re.fullmatch(r"[Nn]?\d+", words[1]) else None
+        n = next((x for x in st["notes"] if x["id"] == nid), None)
+        if not n:
+            die("Usage: pentrail notes rm <N>   |   pentrail notes edit <N> \"<new text>\"")
+        if act == "edit":
+            if len(words) < 3:
+                die("Usage: pentrail notes edit <N> \"<new text>\"")
+            n["text"] = " ".join(words[2:])
+            log_event("note", f"N{nid} edited: {n['text']}")
+            ok(f"N{nid} changed")
+        else:
+            st["notes"] = [x for x in st["notes"] if x is not n]
+            log_event("note", f"N{nid} removed ({n['text']})")
+            ok(f"N{nid} removed")
+        save_state(d, st)
+        return
+    L = _note_links(d, st)
+    want = None
+    if words:
+        h = _find_host(st, words[0])
+        if not h:
+            die(f"Unknown host {words[0]} (see 'pentrail hosts')")
+        want = h["ip"]
+    ns = [n for n in st["notes"] if want is None or n.get("host") == want or want in _mentions(n, L)]
+    if not ns:
+        info('No notes yet. Add one with: pentrail note "<text>"  (on the active box, or -t <host>)')
+        return
+    for n in ns:
+        on = n.get("host") or "project"
+        tag = "" if want is None or n.get("host") == want else f" {DIM}(mentions it){N}"
+        print(f"  {B}N{n['id']:<3}{N} {DIM}{n['ts'][5:16]} {n.get('phase', ''):<8}{N} {C}{on:<15}{N} {n['text']}{tag}")
+    print(f"\n{B}{len(ns)} note(s){N}, also in {NOTES_DOC}. Change one: pentrail notes edit <N> \"<text>\"")
+
+
 _DOC_WARNED = []
 
 def sync_docs(d, st):
@@ -3335,6 +3912,12 @@ def sync_docs(d, st):
     'pentrail report'). Docs never break a command: problems are a warning."""
     try:
         ensure_docs(d)
+        f = d / SCOPE_DOC
+        old = f.read_text()
+        text = old if "<!-- pentrail:auto resolved -->" in old else old.rstrip("\n") + "\n" + SCOPE_DERIVED
+        scope = Scope(d, st)
+        _write_if_changed(f, old, set_blocks(text, {"resolved": render_resolved(scope, st),
+                                                    "conflicts": render_conflicts(scope)}))
         f = phase_dir(d, "enum") / DOC_FILES["enum"]
         old = f.read_text()
         text = old
@@ -3343,17 +3926,26 @@ def sync_docs(d, st):
                 title = h["ip"] + (f" ({h['name']})" if h.get("name") else "")
                 sec = HOST_SECTION.format(title=title, addr=h["ip"], ports=_auto(f"ports {h['ip']}"),
                                           web=_auto(f"web {h['ip']}"), names=_auto(f"names {h['ip']}"),
-                                          leads=_auto(f"leads {h['ip']}"), checklist=_auto(f"checklist {h['ip']}"))
+                                          leads=_auto(f"leads {h['ip']}"), checklist=_auto(f"checklist {h['ip']}"),
+                                          notes=_auto(f"notes {h['ip']}"))
                 mark = "<!-- pentrail:hosts"
                 text = text.replace(mark, sec + mark, 1) if mark in text else text.rstrip("\n") + "\n\n" + sec
+            elif f"<!-- pentrail:auto notes {h['ip']} -->" not in text:
+                text = _add_notes_block(text, h["ip"])        # host sections from before notes
+        L = _note_links(d, st, text)
         blocks = {"overview": render_overview(st), "names": render_names(st),
                   "commands enum": render_commands(st, "enum")}
         for h in st["hosts"]:
             a = h["ip"]
             blocks.update({f"ports {a}": render_ports(st, h), f"web {a}": render_web(st, a),
                            f"names {a}": render_host_names(st, h), f"leads {a}": render_leads(st, a),
-                           f"checklist {a}": render_checklist(st, h, get_block(text, f"checklist {a}"))})
+                           f"checklist {a}": render_checklist(st, h, get_block(text, f"checklist {a}")),
+                           f"notes {a}": render_host_notes(st, h, L)})
         _write_if_changed(f, old, set_blocks(text, blocks))
+        f = d / NOTES_DOC
+        old = f.read_text()
+        _write_if_changed(f, old, set_blocks(old, {"notes-by-host": render_notes_by_host(st, L),
+                                                   "notes-general": render_notes_general(st, L)}))
         for p in PHASE_TITLES:
             f = phase_dir(d, p) / DOC_FILES[p]
             old = f.read_text()
@@ -3538,6 +4130,13 @@ def build_report(d, st, mask=False):
         filled = [l for l in (rules.group(1).splitlines() if rules else []) if re.search(r":[ \t]*\S", l)]
         if filled:
             sc += ["", "**Rules of engagement**", ""] + filled
+        res = resolved_into_scope(scope)
+        if res:
+            sc += ["", "**Hostnames resolving into the scope**", ""] + \
+                  [f"- {n} -> {', '.join(ips)}" for n, ips, _ in res]
+        conflicts, _ = scope_conflicts(scope)
+        if conflicts:
+            sc += ["", "**Scope conflicts** (settle these before you deliver)", ""] + [f"- {c}" for c in conflicts]
     else:
         sc.append("_No scope recorded (0-scope/scope.md)._")
     counts = {s: sum(1 for x in fs if x["sev"] == s) for s in SEVERITIES}
@@ -3681,7 +4280,7 @@ def md_to_html(md):
         if m:
             flush()
             lvl = len(m.group(1))
-            hid = re.sub(r"[^a-z0-9]+", "-", m.group(2).lower()).strip("-")
+            hid = gh_slug(m.group(2))
             out.append(f'<h{lvl} id="{hid}">{_inline(m.group(2))}</h{lvl}>')
             i += 1; continue
         if s.startswith("|") and i + 1 < len(lines) and re.match(r"^\|?\s*:?-{2,}", lines[i + 1].strip()):
@@ -4484,7 +5083,7 @@ HELP_SECTIONS = [
     ("EVERY DAY  (these five carry a whole box)", [
         ("new <name> [target...]", "Start a project: phase folders, docs, scope, VPN.",
                             "Targets may be IPs, ranges, domains or *.domain. --no-vpn to skip it."),
-        ("capture [phase]", "Record your shell: every command with its time, the scope guard,",
+        ("capture [phase] [--warn]", "Record your shell: every command with its time, the scope guard,",
                             "and what the output shows goes into the phase docs."),
         ("next",            "What to enumerate next on the active box, ticked off as you go."),
         ("finding <id|title>", "Turn a confirmed lead into a finding file for the report."),
@@ -4503,7 +5102,10 @@ HELP_SECTIONS = [
         ("scope",           "Show the scope from 0-scope/scope.md and the guard mode."),
         ("scope add|out <asset...>", "Add to In scope / Out of scope (IP, range, domain, *.domain, URL)."),
         ("scope check <host|cmd>", "Is this in scope? Works on a whole command line too."),
-        ("scope guard strict|warn|off", "strict stops out-of-scope commands in a capture (default)."),
+        ("scope resolve",   "Look up the names pentrail knows; names in your ranges join the",
+                            "scope, contradictions (out-of-scope name in a range) are listed."),
+        ("scope guard strict|warn|off", "strict stops out-of-scope commands, warn only reports them",
+                            "(logged). Outside a capture: the setting; inside: this capture only."),
     ]),
     ("WHAT YOU FOUND", [
         ("hosts [host]",    "Hosts with their ports; one host shows ports, web, names, leads."),
@@ -4514,7 +5116,11 @@ HELP_SECTIONS = [
         ("shot [-l label] <cmd>", "Run a command and keep a screenshot + text as evidence."),
         ("shot --last [lines]", "During a capture: screenshot what you just ran."),
         ("ingest <file>",   "Read a saved tool output (nmap -oN/-oX, ffuf, gobuster, ...)."),
-        ("log [n] / note <text>", "The logbook / add a line to it."),
+        ("note [-t host] <text>", "A quick note on the active box (or another host); in notes.md",
+                            "and enum.md. Hosts, #3, F01 and N2 in the text become links."),
+        ("notes [host]",    "List notes (one host: its own and those that mention it);",
+                            "notes edit <N> \"<text>\" / notes rm <N>."),
+        ("log [n]",         "The logbook: everything that happened, with times."),
     ]),
     ("HOSTS & MOVEMENT", [
         ("host add|own|rm <ip>", "Track a host, mark it owned, or stop tracking it."),
@@ -4816,6 +5422,21 @@ def print_help_guide(_args=None):
     print(f"\nConfig lives in {CONFIG_FILE}")
 
 DETAILS.update({
+    "note": ("Jot something down about a target while you work.",
+        "pentrail note [-t <host>|none] <text>",
+        ["Adds note N<n> to the active box (-t another host, -t none for the project), in",
+         " the phase you are in. Inside a capture it also remembers the command you ran last.",
+         "It appears in notes.md (grouped by host, with 'mentioned in' backlinks) and in the",
+         " host's 'Logged notes' in 1-enum/enum.md. Hosts (IP, name, alias), leads (#3),",
+         " findings (F01) and other notes (N2) you mention become links. It is also a line",
+         " in the logbook. Change or remove one with 'pentrail notes edit|rm <N>'."],
+        'pentrail note "login on :8080 looks default, try on 10.10.10.6 - see #3"'),
+    "notes": ("Read back your notes, for everything or for one host.",
+        "pentrail notes [host]   |   notes edit <N> \"<text>\"   |   notes rm <N>",
+        ["No args: every note. A host: its own notes plus the notes that mention it.",
+         "edit replaces a note's text; rm removes it (its number is never reused, so links",
+         " in other notes do not end up pointing at a different note)."],
+        "pentrail notes 10.10.10.6   ;   pentrail notes edit 4 \"creds work on SMB too\""),
     "new": ("Start a project: one folder per phase, working docs, scope and the VPN.",
         "pentrail new <name> [target ...] [--no-vpn]",
         ["Creates ~/pentests/<name>/ with 0-scope ... 5-report folders, a Markdown doc per",
@@ -4825,7 +5446,7 @@ DETAILS.update({
          "Outcome: a ready workspace; 'source .env' gives you $TARGET and $VPN_IP."],
         "pentrail new blackfield 10.10.10.192   ;   pentrail new acme '*.acme.com' --no-vpn"),
     "capture": ("Record the shell you work in; document everything it finds.",
-        "pentrail capture [phase|label] [--plain]",
+        "pentrail capture [phase|label] [--warn | --guard strict|warn|off] [--plain]",
         ["Starts a recording shell (bash or zsh) in the phase you name (recon/enum, foothold,",
          " privesc, lateral, ...); the recording and shots go to that phase's evidence/.",
          "Each command is recorded with its time, folder and exit code, with variables like",
@@ -4835,16 +5456,28 @@ DETAILS.update({
          " hostnames, leads; each is kept with the command that found it and written to the",
          " docs right away, so you can look things up instead of running them again.",
          "Only in-scope results are logged. pentrail's own output is never re-read.",
+         "--warn (or --guard strict|warn|off) sets the guard for this capture only: warn",
+         " reports out-of-scope commands and logs them, but lets them run. Typing",
+         " 'pentrail scope guard strict|warn|off' inside the capture switches it right away.",
          "--plain records without the hook (no guard, the recording is split at prompts)."],
-        "pentrail capture recon   ;   pentrail capture privesc"),
+        "pentrail capture recon   ;   pentrail capture privesc --warn"),
     "scope": ("Say what you may test; the capture shell enforces it.",
         "pentrail scope [add|out|check|guard] ...",
         ["The scope is 0-scope/scope.md: edit it or paste a program's scope under '## In",
          " scope' and '## Out of scope', one asset per line. Assets: 10.10.10.5,",
          " 10.10.10.0/24, 10.10.10.1-50, app.example.com, *.example.com, or a URL.",
          "add / out append to those sections; check tells you whether a host, URL or whole",
-         " command line is in scope; guard sets strict (stop), warn, or off.",
-         "Hostnames that point at an in-scope IP (aliases, /etc/hosts) count as in scope."],
+         " command line is in scope; guard sets strict (stop), warn (report and log, let it",
+         " run) or off. Run outside a capture, guard changes the setting; run inside one, it",
+         " changes only that capture, at once. 'capture --warn' starts a capture in warn mode.",
+         "Names and DNS: a hostname whose addresses all fall inside your in-scope IPs or",
+         " ranges counts as in scope; captures look new names up in DNS and 'scope resolve'",
+         " looks up all of them. They are listed under 'Resolved into the scope' in scope.md.",
+         "Conflicts are listed there too, and the guard stops them: an out-of-scope name that",
+         " resolves into an in-scope range (that IP becomes a conflict; settle it by listing",
+         " the IP under In or Out of scope, or leave it out with --exclude), an in-scope name",
+         " that resolves to an out-of-scope address, a name only partly inside the scope,",
+         " and entries that are both in and out. Out of scope always wins."],
         "pentrail scope add '*.example.com'   ;   pentrail scope check curl https://blog.example.com"),
     "phase": ("Show or set the methodology phase you are in.",
         "pentrail phase [scope|enum|foothold|privesc|lateral|report]",
@@ -4924,11 +5557,17 @@ def build_parser():
 
     s = sub.add_parser("log", help="show the logbook")
     s.add_argument("n", nargs="?", type=int); s.set_defaults(func=cmd_log)
-    s = sub.add_parser("note", help="add a line to the logbook")
+    s = sub.add_parser("note", help="a quick note on the active box (-t <host> for another)")
+    s.add_argument("-t", "--target", help="the host it is about (default: the active box; 'none' = project)")
     s.add_argument("text", nargs="+"); s.set_defaults(func=cmd_note)
+    s = sub.add_parser("notes", help="list notes [host] | rm <N> | edit <N> \"<text>\"")
+    s.add_argument("rest", nargs="*"); s.set_defaults(func=cmd_notes)
     s = sub.add_parser("capture", help="record the shell: scope guard, per-command docs")
     s.add_argument("label", nargs="?")
     s.add_argument("--plain", action="store_true", help="record without the shell hook")
+    s.add_argument("--guard", choices=GUARD_MODES, help="scope guard for this capture only")
+    s.add_argument("--warn", dest="guard", action="store_const", const="warn",
+                   help="this capture only reports out-of-scope commands (same as --guard warn)")
     s.set_defaults(func=cmd_capture)
     s = sub.add_parser("shot", help="screenshot a command (shot <cmd>) or recent capture output (shot --last)")
     s.add_argument("-l", "--label")

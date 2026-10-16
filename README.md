@@ -48,6 +48,7 @@ home screen, `pentrail help` for all commands and `pentrail help <command>` for 
 │   ├── findings/F01-...md    one file per finding
 │   └── report.md             the report template, filled by 'pentrail report'
 ├── loot/                     exported credential lists
+├── notes.md                  your quick notes, by host, linked to hosts, leads and findings
 ├── logbook.md                the timestamped timeline of everything
 ├── state.json                what pentrail knows (hosts, ports, names, leads, commands)
 └── .env                      export TARGET, VPN_IP, ENG  (source it)
@@ -96,7 +97,8 @@ pentrail new acme '*.acme.com' api.acme.io --no-vpn   # targets become "in scope
 pentrail scope add 10.10.10.0/24                       # more in scope
 pentrail scope out blog.acme.com                       # explicitly out of scope
 pentrail scope                                         # show it, with the guard mode
-pentrail scope check ffuf -u https://blog.acme.com/FUZZ   # would this be allowed?
+pentrail scope check https://blog.acme.com             # in scope? (only checks, runs nothing)
+pentrail scope resolve                                 # look up known names, list conflicts
 ```
 
 ```markdown
@@ -127,12 +129,48 @@ What the scope does:
 - **Results land on the right host.** A gobuster run against host B while host A is
   active files its paths under B.
 
-To run one command anyway, prefix it: `scope-ok <command>`. The override is logged.
-Local commands that only handle text (`echo`, `grep`, `cat`, editors and similar)
-are never stopped, and neither is your own machine or tooling sites like github.com.
-`pentrail scope guard warn` only warns, `off` disables the guard, and `strict` is the
-default. The guard works in zsh (Kali's default) and bash. In other shells, or with
-`pentrail capture --plain`, the session is recorded without it.
+### Names in your IP ranges, and conflicts
+
+When the scope is IPs or ranges, names count by where they point. A capture that
+finds a hostname without an address looks it up in DNS first, and
+`pentrail scope resolve` looks up every name pentrail knows. A name whose addresses all
+fall inside the in-scope IPs counts as in scope and is listed in `scope.md` under
+**Resolved into the scope**. Names nmap already printed with their IP need no lookup.
+
+The same lookups expose contradictions, listed in `scope.md` under **Scope conflicts**
+and shown by `pentrail scope`:
+
+| Situation | What pentrail does |
+|---|---|
+| Scope `10.10.10.0/24`, but out-of-scope `blog.acme.com` resolves to `10.10.10.30` | `10.10.10.30` is a conflict: commands on it are stopped, and so is a scan of the whole range unless it leaves the IP out (`nmap ... --exclude 10.10.10.30`). Settle it by listing `10.10.10.30` under In scope or Out of scope. |
+| `*.acme.com` in scope, but `intranet.acme.com` resolves into out-of-scope `10.0.0.0/8` | the name is a conflict and commands on it are stopped |
+| A name resolves partly inside the scope (`1.1.1.1`) and partly outside it (`1.0.0.1`) | a conflict, because traffic may go either way |
+| An entry is both in and out (`app.acme.com` in, `*.acme.com` out) | listed; out of scope wins |
+| An in-scope name points outside your IP ranges | a note: test it by name, not by IP |
+
+### Blocking or informative
+
+The guard has three modes: `strict` stops out-of-scope commands (the default), `warn`
+only reports them, and `off` does not check. In `warn` mode the command runs, you see
+which host is outside the scope, and the logbook keeps a `warned:` line, so you still
+have the record. Results about out-of-scope hosts are not logged in either mode.
+
+You choose the mode in three places:
+
+```bash
+pentrail scope guard warn          # the setting, for every capture (same as: pentrail config scope_guard warn)
+pentrail capture recon --warn      # this capture only (or --guard strict|warn|off)
+pentrail scope guard strict        # typed inside a running capture: switches that capture now
+```
+
+Inside a capture, `scope guard` changes only that capture and leaves the setting alone.
+`pentrail scope` shows which mode is in effect.
+
+To run one command anyway in `strict` mode, prefix it: `scope-ok <command>`. The
+override is logged. Local commands that only handle text (`echo`, `grep`, `cat`,
+editors and similar) are never stopped, and neither is your own machine or tooling
+sites like github.com. The guard works in zsh (Kali's default) and bash. In other
+shells, or with `pentrail capture --plain`, the session is recorded without it.
 
 ## Capturing a shell
 
@@ -176,6 +214,27 @@ pentrail names                 # hostnames and subdomains in scope
 pentrail names --plain         # one per line, to feed other tools
 pentrail vectors               # leads, working > open > done > dead
 ```
+
+### Notes, linked to your targets
+
+```bash
+pentrail note "admin panel on :8080, try the same login on 10.10.10.6 - see #3"
+pentrail note -t 10.10.10.6 "SSH open; test the creds from N1 here"
+pentrail note -t none "client: no active scans after 17:00"
+pentrail notes                  # all notes
+pentrail notes 10.10.10.6       # its own notes plus the ones that mention it
+pentrail notes edit 2 "..."     # or: pentrail notes rm 2
+```
+
+A note goes on the active box unless you name another host (`-t`), or on the project
+with `-t none`. It remembers the phase and, inside a capture, the command you ran last.
+Every note shows up in `notes.md`, grouped by host, and under **Logged notes** in that
+host's section of `1-enum/enum.md`. Whatever a note mentions becomes a link: hosts (IP,
+name or alias) link to their section, `#3` to the lead, `F01` to the finding file and
+`N2` to the other note. Each host also lists the notes that mention it. The links are
+normal Markdown links, so they work on GitHub, in VS Code and in other editors. Longer
+notes of your own go under **Your notes** in `notes.md`, or in the **Notes** section of
+any doc.
 
 ### Screenshots
 
@@ -256,9 +315,9 @@ pentrail flag user 2f1c...9ab     # user/root also marks the box owned
 
 ## The logbook
 
-Every action lands in `logbook.md` with a time and a tag: captures, new leads, scope
-blocks and overrides, phase changes, findings and reports. `pentrail log` shows it and
-`pentrail note "<text>"` adds a line.
+Every action lands in `logbook.md` with a time and a tag: captures, new leads, notes,
+scope blocks, warnings and overrides, phase changes, findings and reports.
+`pentrail log` shows it.
 
 ## Install
 
@@ -298,8 +357,8 @@ VPN when it hangs. `new` connects automatically unless you pass `--no-vpn` or ha
 | `target <host>` | set the active box (IP or hostname) |
 | `phase [name]` | show or set the phase |
 | `docs` | list the working docs, refresh them |
-| `scope [add\|out\|check\|guard]` | the scope and the guard |
-| `capture [phase] [--plain]` | record a shell: scope guard, per-command docs |
+| `scope [add\|out\|check\|resolve\|guard]` | the scope, DNS lookups and conflicts, and the guard |
+| `capture [phase] [--warn] [--plain]` | record a shell: scope guard, per-command docs |
 | `shot [-l label] <cmd>` / `shot --last` | screenshot evidence |
 | `ingest <file>` | read a saved tool output |
 | `next` | enumeration checklist for the active box |
@@ -309,7 +368,8 @@ VPN when it hangs. `new` connects automatically unless you pass `--no-vpn` or ha
 | `finding [<id>\|"title"\|F01] [-s sev]` | findings |
 | `report [--mask] [--html] [--pdf]` | fill and export the report |
 | `host add\|own\|rm`, `pivot <from> <to>` | hosts and movement |
-| `flag`, `set`, `focus`, `note`, `log` | flags, facts, focus, logbook |
+| `note [-t host] <text>`, `notes [host]\|edit\|rm` | quick notes, linked to hosts, leads, findings |
+| `flag`, `set`, `focus`, `log` | flags, facts, focus, logbook |
 | `redact add\|list\|clear` | keep your own secrets out of captures |
 | `up`, `down`, `restart`, `status`, `check`, `watch` | VPN |
 | `resolve [ip] <name...>` / `resolve --clean` | `/etc/hosts` entries |
