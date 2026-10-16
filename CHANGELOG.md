@@ -5,6 +5,48 @@ releases**: every update bumps the version (1.0 → 1.1 → 1.2 …). The versio
 in `pentrail.py` (`VERSION`) and `pentrail version` prints it; `pentrail update`
 shows the old → new version when it reinstalls.
 
+## 1.2
+
+Added
+- Project folders per methodology phase (`0-scope` … `5-report`), each with a Markdown
+  working doc. pentrail fills the auto blocks between its markers and never touches
+  your own text. `pentrail phase` and `pentrail docs`.
+- Scope in `0-scope/scope.md` (IPs, CIDRs, ranges, domains, `*.domain`, URLs; in and
+  out of scope). `pentrail scope add|out|check|guard`. `new` accepts several targets,
+  domains included, and `--no-vpn`.
+- Scope guard in the capture shell (zsh and bash): commands aimed at hosts outside the
+  scope are stopped before they run; `scope-ok <cmd>` overrides once. Blocks and
+  overrides are logged. `shot` is checked too.
+- Per-command capture: each command is recorded with time, duration, exit code and
+  folder, with variables filled in. Output is read after every command, so docs and
+  lookups are current during the capture. Every port, path, name and lead keeps the
+  command that found it ("Found by").
+- More output understood: nmap versions/OS/hostnames (normal, greppable and XML),
+  rustscan, masscan, ffuf (words and vhosts), dirsearch, dirb, wfuzz, gobuster
+  vhost/dns, amass, dnsx, subdomain tool lists, httpx, whatweb, nuclei, nikto, and
+  curl/wget status. Ports are now stored per host.
+- Findings: `pentrail finding <vector-id|"title"|F01>` writes
+  `5-report/findings/F01-….md` with severity, weakness, asset, the command, the output
+  and the evidence. `F01` prints it clean for a bug bounty submission.
+- Report template `5-report/report.md`, filled by `pentrail report`: details, scope and
+  rules, findings overview and findings, a walkthrough from the phase docs, and an
+  appendix. Your own sections are kept. `--html` exports a styled page and `--pdf`
+  a PDF when chromium, wkhtmltopdf or pandoc is installed.
+- `pentrail hosts <host>` (detail view) and `pentrail names [--plain]`.
+- `pentrail ingest` and `next` read `1-enum/scans/` automatically; nmap files supply
+  their own command line as "Found by".
+
+Changed
+- One command per noun: `vector`/`vectors`, `cred`/`creds`, `finding`/`findings`,
+  `hosts`/`map` are aliases, and with no arguments each one lists.
+- `.env` exports its variables; the capture shell sets `$TARGET` itself.
+- `next` uses the ports pentrail knows per host and ticks steps from recorded commands
+  against that host. The same checklist is in `1-enum/enum.md`.
+- Web paths are all documented in `enum.md`. Only interesting ones (admin, backup,
+  upload, .git, …) become leads.
+- Help and home screen rebuilt around the five everyday commands.
+- state.json schema 2, migrated automatically from older projects.
+
 ## 1.1
 
 Added
