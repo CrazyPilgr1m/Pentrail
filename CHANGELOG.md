@@ -16,7 +16,16 @@ Added
   domains included, and `--no-vpn`.
 - Scope guard in the capture shell (zsh and bash): commands aimed at hosts outside the
   scope are stopped before they run; `scope-ok <cmd>` overrides once. Blocks and
-  overrides are logged. `shot` is checked too.
+  overrides are logged. `shot` is checked too. `--exclude` lists are honoured.
+- Guard modes: `strict` (stop), `warn` (report and log, let it run) and `off`. Set it
+  with `pentrail scope guard` (the setting), per capture with `capture --warn` /
+  `--guard`, or switch a running capture by typing `pentrail scope guard` inside it.
+- Names and DNS: with an IP or range scope, hostnames are looked up (during captures,
+  and for all known names with `pentrail scope resolve`). Names whose addresses all
+  fall in scope join it ("Resolved into the scope" in scope.md). Conflicts are listed
+  in scope.md and stopped by the guard: an out-of-scope name inside an in-scope range,
+  an in-scope name pointing at an out-of-scope address, a name partly inside the
+  scope, and entries that are both in and out.
 - Per-command capture: each command is recorded with time, duration, exit code and
   folder, with variables filled in. Output is read after every command, so docs and
   lookups are current during the capture. Every port, path, name and lead keeps the
@@ -32,6 +41,11 @@ Added
   rules, findings overview and findings, a walkthrough from the phase docs, and an
   appendix. Your own sections are kept. `--html` exports a styled page and `--pdf`
   a PDF when chromium, wkhtmltopdf or pandoc is installed.
+- Notes: `pentrail note [-t host] "<text>"` puts a note on the active box (or another
+  host, or the project), with its phase and the last command in the capture. Notes
+  show in `notes.md` by host and under "Logged notes" in the host's section of
+  enum.md; hosts, leads (#3), findings (F01) and notes (N2) they mention become links,
+  with "mentioned in" backlinks. `pentrail notes [host] | edit | rm`.
 - `pentrail hosts <host>` (detail view) and `pentrail names [--plain]`.
 - `pentrail ingest` and `next` read `1-enum/scans/` automatically; nmap files supply
   their own command line as "Found by".
