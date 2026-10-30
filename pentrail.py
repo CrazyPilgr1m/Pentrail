@@ -15,7 +15,10 @@ Pure Python 3, standard library only.
 """
 import argparse
 import base64
+import fnmatch
+import functools
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -26,11 +29,16 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+try:
+    import fcntl                # POSIX: the project lock, see locked()
+except ImportError:
+    fcntl = None
 
-VERSION = "1.2"                 # bump on every update (point release); see CHANGELOG.md
+VERSION = "1.8"                 # bump on every update (point release); see CHANGELOG.md
 SCHEMA = 2                      # state.json layout version; _migrate() upgrades older files
 HOME = Path.home()
 CONFIG_FILE = Path(os.environ.get("PENTRAIL_CONFIG", HOME / ".config" / "pentrail" / "config.json"))
@@ -57,8 +65,12 @@ DEFAULTS = {
     "scope_guard": "strict",  # capture shell: strict = stop commands aimed outside scope, warn, off
     "scope_allow": "",        # extra hosts that are never targets (comma-separated), e.g. your VPS
     "author": "",             # tester name on the report
+    "pete_rules": "off",      # on = new projects' scope.md gets the PeTe rules (what an AI assistant may run)
+    "auto_shot": "off",       # on = in a capture, every command that finds something is kept as a screenshot
+    "ai_auto": "off",         # on = 'pentrail new' also installs PeTe, the AI layer (as with --ai)
 }
 INT_KEYS = ("connect_timeout", "stale_minutes")
+ONOFF_KEYS = ("pete_rules", "auto_shot", "ai_auto")
 GUARD_MODES = ("strict", "warn", "off")
 
 # Tools pentrail knows about, used by both 'doctor' (report) and 'setup' (install).
@@ -146,21 +158,49 @@ def find_wordlists(limit=15):
 IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 # ----------------------------------------------------------------------------- output
-_TTY = sys.stdout.isatty()
+# Colours on a terminal only (never with NO_COLOR set). Symbols when the terminal
+# speaks UTF-8, the classic [+] [*] [!] [-] when it does not.
+_TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 def _c(code): return code if _TTY else ""
-R, G, Y, B, C, DIM, N = (_c(x) for x in
-    ("\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[36m", "\033[2m", "\033[0m"))
-def info(m): print(f"{B}[*]{N} {m}")
-def ok(m):   print(f"{G}[+]{N} {m}")
-def warn(m): print(f"{Y}[!]{N} {m}")
-def err(m):  print(f"{R}[-]{N} {m}", file=sys.stderr)
+R, G, Y, B, C, M, DIM, BOLD, N = (_c(x) for x in
+    ("\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[36m", "\033[35m", "\033[2m", "\033[1m", "\033[0m"))
+_UTF = "utf" in (getattr(sys.stdout, "encoding", None) or "").lower()
+def _u(fancy, plain):
+    return fancy if _UTF else plain
+SYM = {"ok": _u("✔", "[+]"), "info": _u("•", "[*]"), "warn": _u("⚠", "[!]"), "err": _u("✖", "[-]"),
+       "ask": _u("?", "[?]"), "next": _u("➜", "->"), "todo": _u("○", "[ ]"), "done": _u("✔", "[x]"),
+       "new": _u("✚", "+"), "shot": _u("◉", "(shot)"), "run": _u("◷", "~"), "dot": _u("·", "-")}
+def info(m): print(f"{B}{SYM['info']}{N} {m}")
+def ok(m):   print(f"{G}{SYM['ok']}{N} {m}")
+def warn(m): print(f"{Y}{SYM['warn']}{N} {m}")
+def err(m):  print(f"{R}{SYM['err']}{N} {m}", file=sys.stderr)
 def die(m, code=1):
     err(m); sys.exit(code)
 def confirm(m):
     try:
-        return input(f"{Y}[?]{N} {m} [y/N] ").strip().lower() in ("y", "j")
+        return input(f"{Y}{SYM['ask']}{N} {m} [y/N] ").strip().lower() in ("y", "j")
     except EOFError:
         return False
+
+_SGR = re.compile(r"\x1b\[[0-9;]*m")
+def _vlen(s):
+    """Width of a line as shown: colour codes take no room."""
+    return len(_SGR.sub("", s))
+
+def box(title, rows, col=None):
+    """Print rows in a rounded box with the title in its top border."""
+    col = B if col is None else col
+    tl, tr, bl, br, h, v = (_u("╭", "+"), _u("╮", "+"), _u("╰", "+"), _u("╯", "+"), _u("─", "-"), _u("│", "|"))
+    w = max([_vlen(r) for r in rows] + [_vlen(title) + 2]) + 2
+    print(f"{col}{tl}{h} {N}{BOLD}{title}{N}{col} {h * max(0, w - _vlen(title) - 3)}{tr}{N}")
+    for r in rows:
+        print(f"{col}{v}{N} {r}{' ' * (w - _vlen(r) - 2)} {col}{v}{N}")
+    print(f"{col}{bl}{h * w}{br}{N}")
+
+def bar(done, total, width=12):
+    """A small progress bar: ▰▰▰▱▱▱ (or [###...] without UTF-8)."""
+    k = round(width * done / total) if total else 0
+    return _u(f"{G}{'▰' * k}{DIM}{'▱' * (width - k)}{N}", f"[{'#' * k}{'.' * (width - k)}]")
 
 # ----------------------------------------------------------------------------- config
 def load_config():
@@ -193,6 +233,10 @@ def set_config(key, val):
 CFG = load_config()
 SUDO = [] if os.geteuid() == 0 else ["sudo"]
 
+def cfg_on(key):
+    """An on/off setting (ONOFF_KEYS): on, true, yes or 1 is on."""
+    return str(CFG.get(key, "off")).strip().lower() in ("on", "true", "yes", "1")
+
 def warn_if_root():
     """Least privilege: pentrail runs as your normal user and sudo's only the few
     steps that need root. Running the whole tool via sudo makes every file and the
@@ -214,18 +258,32 @@ def _now():
 
 # ----------------------------------------------------------------------------- project state
 def current_dir():
+    """The active project. $PENTRAIL_PROJECT (a project path or name) pins one shell
+    or AI session to its project; otherwise it is the one new/use/resume chose."""
+    pin = os.environ.get("PENTRAIL_PROJECT")
+    if pin:
+        p = resolve_project(pin)
+        return p.resolve() if p else None
     d = _read(CURRENT_FILE)
     return Path(d) if d and Path(d).is_dir() else None
 
 def require_engagement():
     d = current_dir()
     if not d:
+        pin = os.environ.get("PENTRAIL_PROJECT")
+        if pin:
+            die(f"PENTRAIL_PROJECT={pin} is not a pentrail project (a project folder, or a "
+                f"name in {CFG['base_dir']})")
         die("No active project - run 'pentrail new <name>' first")
     return d
 
 def set_current(d):
     CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CURRENT_FILE.write_text(str(d))
+    pin = os.environ.get("PENTRAIL_PROJECT")
+    if pin:
+        warn(f"PENTRAIL_PROJECT={pin} pins this shell to its project; {Path(d).name} is now "
+             "the active project for your other terminals.")
 
 def _atomic_write(path, text):
     """Write via a temp file + os.replace so a crash can't corrupt the target."""
@@ -290,6 +348,60 @@ def save_state(d, st, docs=True):
     _atomic_write(d / "state.json", json.dumps(st, indent=2) + "\n")
     if docs:
         sync_docs(d, st)
+
+# Two pentrail processes on one project at once (your capture and an AI assistant's
+# shots, or two terminals) must not overwrite each other's state.json, so every
+# read-change-save holds the project lock. The kernel drops an flock when its
+# process dies, so a crash never leaves a project locked.
+_HELD = {}
+
+@contextmanager
+def locked(d, wait=60.0):
+    """Hold the project's state lock. Nested calls in one process pass through."""
+    key = os.path.join(str(d), ".pentrail.lock")
+    if key in _HELD:
+        yield
+        return
+    fd = None
+    if fcntl is not None:
+        try:
+            fd = os.open(key, os.O_RDWR | os.O_CREAT, 0o600)
+            deadline = time.time() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        warn(f"Another pentrail process has held {Path(d).name} for {int(wait)}s; "
+                             "going on without waiting for it.")
+                        os.close(fd)
+                        fd = None
+                        break
+                    time.sleep(0.05)
+        except OSError:                 # no lock possible here (read-only folder, ...)
+            if fd is not None:
+                os.close(fd)
+            fd = None
+    _HELD[key] = fd
+    try:
+        yield
+    finally:
+        del _HELD[key]
+        if fd is not None:
+            os.close(fd)                # closing it releases the lock
+
+def with_lock(fn):
+    """For commands that read, change and save state quickly: hold the active
+    project's lock for the whole command (see locked())."""
+    @functools.wraps(fn)
+    def run(args):
+        d = current_dir()
+        if not d:
+            return fn(args)
+        with locked(d):
+            return fn(args)
+    return run
 
 def _env_value(d, key):
     m = re.search(rf'^(?:export\s+)?{key}="?(.*?)"?$', _read(d / ".env"), re.M)
@@ -362,16 +474,26 @@ def ensure_layout(d, scope_assets=()):
     ensure_docs(d, scope_assets)
 
 # ----------------------------------------------------------------------------- logbook
-def log_event(kind, text, d=None):
-    """Append a timestamped, typed line to the project logbook."""
+def actor(name=None):
+    """Who does something, when it is not you: 'shot --by <name>', else $PENTRAIL_ACTOR
+    (set by an AI assistant or a script). '' means you. Letters, digits and . _ - @
+    only, so it is safe in the logbook and in the docs' tables."""
+    return re.sub(r"[^A-Za-z0-9._@-]", "", name or os.environ.get("PENTRAIL_ACTOR", ""))[:32]
+
+def log_event(kind, text, d=None, by=None):
+    """Append a timestamped, typed line to the project logbook, ending in
+    '(by <actor>)' when someone else did it (see actor())."""
     d = d or current_dir()
     if not d:
         return
+    who = actor(by)
+    text = redact_text(text)[0]          # your own secrets never reach the logbook
     f = d / "logbook.md"
     if not f.exists():
         f.write_text(f"# Logbook - {d.name}\n\n")
     with f.open("a") as fh:
-        fh.write(f"- {datetime.now():%Y-%m-%d %H:%M:%S}  `{kind:<8}` {text}\n")
+        fh.write(f"- {datetime.now():%Y-%m-%d %H:%M:%S}  `{kind:<8}` {text}"
+                 + (f"  (by {who})" if who else "") + "\n")
 
 def cmd_log(args):
     d = require_engagement()
@@ -1318,11 +1440,14 @@ def guard_verdicts(scope, cmd, cwd=None, dns=True):
     return res, notes
 
 def _save_lookups(d, st, scope):
-    """Keep DNS answers the guard fetched, so the next check does not ask again."""
+    """Keep DNS answers the guard fetched, so the next check does not ask again.
+    They go into a fresh copy of the state: 'st' may have been read a while ago."""
     if scope.looked_up:
-        for n, ips in scope.looked_up.items():
-            st["dns"][n] = {"ips": ips, "ts": _now()}
-        save_state(d, st)
+        with locked(d):
+            fresh = load_state(d)
+            for n, ips in scope.looked_up.items():
+                fresh["dns"][n] = st["dns"][n] = {"ips": ips, "ts": _now()}
+            save_state(d, fresh)
 
 GUARD_TEXT = {"strict": "stops commands aimed outside the scope",
               "warn": "reports commands aimed outside the scope, does not stop them",
@@ -1344,10 +1469,11 @@ def guard_mode():
     mode = CFG.get("scope_guard", "strict")
     return mode if mode in GUARD_MODES else "strict"
 
-def scope_gate(d, st, line, values=None, cwd=None):
+def scope_gate(d, st, line, values=None, cwd=None, by=None):
     """Apply the scope guard to a command line. Returns (allowed, message lines).
     Used by the capture shell before each command and by 'shot' before it runs one.
-    Blocks and overrides go to the logbook, so you have the trail if asked."""
+    Blocks and overrides go to the logbook, so you have the trail if asked; 'by'
+    is who runs it (see actor())."""
     scope = Scope(d, st)
     mode = guard_mode()
     if not scope.defined or mode == "off":
@@ -1367,13 +1493,18 @@ def scope_gate(d, st, line, values=None, cwd=None):
     if not bad:
         return True, msgs
     what = ", ".join(f"{t} ({VERDICT_TEXT[v]}{': ' + why if why else ''})" for t, v, why in bad)
+    who = actor(by)
+    if override and who:                  # an AI assistant or a script never overrides the scope
+        log_event("scope", f"refused override: {expanded}  [{what}]", d, by)
+        return False, msgs + [f"BLOCKED: {what}. Not run: scope overrides are for you, not for {who}.",
+                              f"  scope -> {scope.summary()}"]
     if override:
-        log_event("scope", f"override: {expanded}  [{what}]", d)
+        log_event("scope", f"override: {expanded}  [{what}]", d, by)
         return True, msgs + [f"scope override for {what}: logged"]
     if mode == "warn":                    # informative: say it, log it, let it run
-        log_event("scope", f"warned: {expanded}  [{what}]", d)
+        log_event("scope", f"warned: {expanded}  [{what}]", d, by)
         return True, msgs + [f"out of scope (guard warn, running it): {what}. Logged."]
-    log_event("scope", f"blocked: {expanded}  [{what}]", d)
+    log_event("scope", f"blocked: {expanded}  [{what}]", d, by)
     hint = ("  a conflict: ask the client or program, then list the IP under In scope or Out of scope"
             if any(v == "conflict" for _, v, _ in bad) else
             "  belongs in scope?  pentrail scope add <host>")
@@ -1411,6 +1542,8 @@ def scope_append(d, which, values):
 VERDICT_TEXT = {"in": "in scope", "out": "OUT of scope", "unknown": "not in scope",
                 "conflict": "CONFLICT", "self": "your own machine",
                 "allow": "tooling host (never a target)", "none": "no scope set"}
+# 'scope check' answers with its exit code too, for scripts and AI assistants
+CHECK_STATUS = {0: "in", 3: "out", 2: "no-host", 4: "no-scope"}
 
 def resolve_all(d, st, scope=None, timeout=5.0):
     """Look up every name pentrail knows (found names, hostnames in the scope, host
@@ -1430,13 +1563,24 @@ def resolve_all(d, st, scope=None, timeout=5.0):
                 h["aliases"].append(n)
     return found
 
+@with_lock
 def cmd_scope(args):
     d = require_engagement()
     st = load_state(d)
     act, rest = (args.action or "show").lower(), list(args.rest or [])
+    as_json = getattr(args, "json", False)
+    while act == "check" and rest and "--json" in (rest[0], rest[-1]):   # check --json <x> / <x> --json
+        rest.pop(0 if rest[0] == "--json" else -1)
+        as_json = True
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    if act != "check" and "--json" in rest:
+        as_json = True
+    if as_json and act != "check":
+        die("--json goes with 'pentrail scope check'")
     if act in ("add", "in", "out", "exclude"):
         which = "out" if act in ("out", "exclude") else "in"
-        if not rest:
+        if not rest or rest[0] in ("-h", "--help"):
             die(f"Usage: pentrail scope {act} <ip|range|domain|*.domain|url> [...]")
         bad = [v for v in rest if not parse_asset(v)]
         if bad:
@@ -1457,21 +1601,37 @@ def cmd_scope(args):
             info("Already listed.")
         return
     if act == "check":
-        if not rest:
-            die("Usage: pentrail scope check <host|url ...>")
+        if not rest or rest[0] in ("-h", "--help"):
+            die("Usage: pentrail scope check [--json] <host|url|command ...>")
+        line = " ".join(rest)
         scope = Scope(d, st)
-        if not scope.defined:
-            info(f"No scope set yet ({SCOPE_DOC}): nothing is blocked.")
-            return
-        res, notes = guard_verdicts(scope, " ".join(rest), os.getcwd())
+        res, notes = guard_verdicts(scope, line, os.getcwd())
         _save_lookups(d, st, scope)
-        if not res:
-            info("No host, IP or URL found in that.")
-        for t, v, why in res:
-            col = {"in": G, "out": R, "unknown": Y, "conflict": R}.get(v, DIM)
-            print(f"  {col}{VERDICT_TEXT[v]:<16}{N} {t}" + (f"  {DIM}{why}{N}" if why else ""))
-        for n in notes:
-            print(f"  {DIM}note: {n}{N}")
+        # 0 all in scope (or your machine / a tooling host), 3 anything the guard would
+        # stop, 2 no host in it, 4 no scope set
+        code = 4 if not scope.defined else 2 if not res else \
+            3 if any(v in ("out", "unknown", "conflict") for _, v, _ in res) else 0
+        if as_json:
+            print(json.dumps({"input": line, "status": CHECK_STATUS[code], "exit": code,
+                              "guard": guard_mode(),
+                              "targets": [{"target": t, "verdict": v, "text": VERDICT_TEXT[v], "why": why}
+                                          for t, v, why in res],
+                              "notes": notes}, indent=2))
+        elif code == 4:
+            info(f"No scope set yet ({SCOPE_DOC}): nothing is blocked.")
+        else:
+            if not res:
+                info("No host, IP or URL found in that.")
+            for t, v, why in res:
+                col = {"in": G, "out": R, "unknown": Y, "conflict": R}.get(v, DIM)
+                icon = {"in": SYM["ok"], "out": SYM["err"], "unknown": SYM["err"], "conflict": SYM["warn"]}.get(v, SYM["info"])
+                print(f"  {col}{icon} {VERDICT_TEXT[v]:<16}{N} {t}" + (f"  {DIM}{why}{N}" if why else ""))
+            for n in notes:
+                print(f"  {DIM}note: {n}{N}")
+            if res:
+                print(f"  {DIM}{'cleared: the guard lets this through' if code == 0 else 'not cleared: the guard stops this (exit 3)'}{N}")
+        if code:
+            sys.exit(code)
         return
     if act == "resolve":
         scope = Scope(d, st)
@@ -1558,6 +1718,8 @@ def cmd_new(args):
     name = args.name
     if name in (".", "..") or not re.match(r"^[A-Za-z0-9._-]+$", name):
         die("Name may only contain letters, digits and . _ - (and not '.' or '..')")
+    if args.ai and args.no_ai:
+        die("--ai or --no-ai, not both")
     assets = []
     for t in args.targets or []:
         a = parse_asset(t)
@@ -1573,16 +1735,17 @@ def cmd_new(args):
 
     # Scaffold everything to disk BEFORE touching the VPN, so a VPN that cannot come
     # up never leaves a half-made project. The tunnel IP goes into .env afterwards.
-    ensure_layout(d, [t for t, _ in assets])
-    if existed and assets:
-        scope_append(d, "in", [t for t, _ in assets])
-    st = load_state(d)
-    target = next((x for x in (_target_of(a) for _, a in assets) if x), None) or st.get("target", "")
-    if target and not _find_host(st, target):
-        st["hosts"].append(host_entry(target, name if _ip_obj(target) else ""))
-    st["target"] = target
-    save_state(d, st)
-    write_env(d, target, None)
+    with locked(d):
+        ensure_layout(d, [t for t, _ in assets])
+        if existed and assets:
+            scope_append(d, "in", [t for t, _ in assets])
+        st = load_state(d)
+        target = next((x for x in (_target_of(a) for _, a in assets) if x), None) or st.get("target", "")
+        if target and not _find_host(st, target):
+            st["hosts"].append(host_entry(target, name if _ip_obj(target) else ""))
+        st["target"] = target
+        save_state(d, st)
+        write_env(d, target, None)
     log_event("new", f"session started - target {target or '?'}"
               + (f", scope: {', '.join(t for t, _ in assets)}" if assets else ""))
 
@@ -1608,6 +1771,13 @@ def cmd_new(args):
     if not assets:
         print(f"    {Y}no scope yet{N}: pentrail scope add <ip|range|domain|*.domain>")
     print(f'    cd "{d}" && source .env      then: pentrail capture recon')
+    if args.ai or (cfg_on("ai_auto") and not args.no_ai):      # PeTe, the AI layer
+        print()
+        src = ai_source()
+        if src:
+            ai_installed_msg(d.resolve(), ai_install(d, src))
+        else:
+            warn("PeTe was not installed. " + AI_MISSING)
 
 def resolve_project(name):
     """A project by name under base_dir, or a path to a project folder."""
@@ -1631,42 +1801,56 @@ def latest_project():
     return max(_projects(), key=mtime, default=None)
 
 def project_summary(d, loglines=6):
+    """The project card: where you are, what was found, and what is next."""
     st = load_state(d)
+    sc = Scope(d, st)
     owned = sum(1 for h in st["hosts"] if h["owned"])
     openp = [p for p in st["vectors"] if p["status"] in ("open", "working")]
-    dom = st.get("facts", {}).get("domain")
-    info(f"Project {B}{d.name}{N}   target: {st.get('target') or '-'}   phase: {st.get('phase')}"
-         + (f"   domain: {dom}" if dom else ""))
-    sc = Scope(d, st)
-    print(f"    scope  : {sc.summary() + '   guard: ' + guard_mode() if sc.defined else Y + 'not set' + N + ' (pentrail scope add ...)'}")
+    nports = sum(len(h["ports"]) for h in st["hosts"])
+    dot = f" {DIM}{SYM['dot']}{N} "
+    def lab(s):
+        return f"{DIM}{s:<6}{N}"
+    vpn = f"{G}up{N}" if vpn_running() else f"{DIM}down{N}"
+    rows = [f"{lab('target')}  {st.get('target') or '-':<17} {lab('phase')}  {st.get('phase') or '-':<9} {DIM}VPN{N} {vpn}",
+            f"{lab('scope')}  " + (f"{sc.summary()}{dot}{DIM}guard{N} {guard_mode()}" if sc.defined
+                                   else f"{Y}not set{N}  {DIM}pentrail scope add <host>{N}")]
+    if st.get("facts", {}).get("domain"):
+        rows.append(f"{lab('domain')}  {st['facts']['domain']}")
     if st.get("focus"):
-        print(f"    focus  : {Y}{st['focus']}{N}")
-    if st["hosts"]:
-        nports = sum(len(h["ports"]) for h in st["hosts"])
-        print(f"    hosts  : {len(st['hosts'])} ({owned} owned), {nports} open port(s), "
-              f"{len(st['web'])} web path(s), {len(st['names'])} name(s)")
-    print(f"    vectors: {len(openp)} open/working of {len(st['vectors'])}"
-          + (f"   creds: {len(_norm_creds(st))}" if st.get("creds") else "")
-          + (f"   findings: {len(list_findings(d))}" if list_findings(d) else ""))
+        rows.append(f"{lab('focus')}  {Y}{st['focus']}{N}")
+    rows.append(f"{lab('found')}  {len(st['hosts'])} host(s), {owned} owned{dot}{nports} port(s){dot}"
+                f"{len(st['web'])} web path(s){dot}{len(st['names'])} name(s)")
+    rows.append(f"{lab('leads')}  {len(openp)} open of {len(st['vectors'])}{dot}{len(list_findings(d))} finding(s)"
+                + (f"{dot}{len(_norm_creds(st))} credential(s)" if st.get("creds") else ""))
+    extra = [f"{M}{SYM['shot']}{N} auto-shot on"] if cfg_on("auto_shot") else []
+    if (d / ".claude" / "pentrail-ai.json").exists():
+        extra.append(f"{M}PeTe{N} on")
+    if extra:
+        rows.append(f"{lab('extras')}  " + dot.join(extra))
+    box(d.name + (f" {DIM}(PENTRAIL_PROJECT){N}" if os.environ.get("PENTRAIL_PROJECT") else ""), rows)
     for p in [p for p in st["vectors"] if p["status"] == "working"][:5]:
-        print(f"      {C}working{N} #{p['id']} {p['desc']}")
+        print(f"  {C}working{N} #{p['id']} {p['desc']}")
     facts = {k: v for k, v in st.get("facts", {}).items() if k != "domain"}
     if facts:
-        print("    facts  : " + ", ".join(f"{k}={v}" for k, v in facts.items()))
+        print(f"  {DIM}facts{N}   " + ", ".join(f"{k}={v}" for k, v in facts.items()))
+    nxt = _next_up(d, st)
+    if nxt:
+        print(f"  {C}{SYM['next']} next up{N}  {nxt}  {DIM}(all of it: pentrail next){N}")
     lines = [l for l in _read(d / "logbook.md").splitlines() if l.startswith("- ")]
     if lines and loglines:
-        print("    last activity:")
+        print(f"  {DIM}last activity{N}")
         for l in lines[-loglines:]:
-            print(f"      {DIM}{l[2:]}{N}")
+            print(f"    {DIM}{l[2:]}{N}")
 
 def cmd_use(args):
     d = resolve_project(args.name)
     if not d:
         die(f"No project '{args.name}' in {CFG['base_dir']} - run 'pentrail new {args.name}'")
     set_current(d)
-    ensure_layout(d)
-    st = load_state(d)
-    save_state(d, st)
+    with locked(d):
+        ensure_layout(d)
+        st = load_state(d)
+        save_state(d, st)
     ok(f"Active project: {d.name} (target: {st.get('target') or '-'})")
     print(f'    cd "{d}" && source .env')
 
@@ -1680,8 +1864,9 @@ def cmd_resume(args):
         if not d:
             die("No project to resume. Start one with 'pentrail new <name>'.")
     set_current(d)
-    ensure_layout(d)
-    save_state(d, load_state(d))
+    with locked(d):
+        ensure_layout(d)
+        save_state(d, load_state(d))
     ok(f"Resumed {d.name}")
     log_event("resume", "session resumed")
     if vpn_running():
@@ -1707,6 +1892,7 @@ def cmd_list(args):
               f"{len(st['hosts'])} host(s), {owned} owned, {openp} open vector(s), "
               f"{len(list_findings(d))} finding(s)")
 
+@with_lock
 def cmd_phase(args):
     d = require_engagement()
     st = load_state(d)
@@ -1724,6 +1910,7 @@ def cmd_phase(args):
     log_event("phase", p)
     ok(f"Phase: {p}  (captures and shots now go to {PHASE_DIRS[p]}/)")
 
+@with_lock
 def cmd_docs(args):
     d = require_engagement()
     ensure_layout(d)
@@ -1761,6 +1948,7 @@ def _ensure_host(st, addr, name=""):
         h["name"] = name
     return h
 
+@with_lock
 def cmd_target(args):
     d = require_engagement()
     st = load_state(d)
@@ -1820,6 +2008,16 @@ def show_host(d, st, h):
 def cmd_hosts(args):
     d = require_engagement()
     st = load_state(d)
+    if getattr(args, "json", False):
+        hs = st["hosts"]
+        if getattr(args, "ip", None):
+            h = _find_host(st, args.ip)
+            if not h:
+                die(f"Unknown host {args.ip} (see 'pentrail hosts')")
+            hs = [h]
+        print(json.dumps({"project": d.name, "active_box": st.get("target", ""),
+                          "hosts": [host_json(st, h) for h in hs]}, indent=2))
+        return
     if getattr(args, "ip", None):
         h = _find_host(st, args.ip)
         if not h:
@@ -1840,6 +2038,7 @@ def cmd_hosts(args):
             print(f"  {l[2:21]}  {m.group(1) if m else ''}")
     print(f"\n{DIM}Details of one host: pentrail hosts <ip|name>{N}")
 
+@with_lock
 def cmd_host(args):
     d = require_engagement()
     st = load_state(d)
@@ -1874,6 +2073,7 @@ def cmd_host(args):
         ok(f"Removed host {h['ip']}")
     save_state(d, st)
 
+@with_lock
 def cmd_pivot(args):
     d = require_engagement()
     st = load_state(d)
@@ -1927,6 +2127,7 @@ def add_vector(d, st, desc, host="", status="open", sig=None, ptype="misc", by=N
 USAGE_VECTOR = ('Usage: pentrail vector add "<desc>" [-t <type>]   |   '
                 "pentrail vector <status> <id>   (status: open|working|dead|done)   |   vector rm <id>")
 
+@with_lock
 def cmd_vector(args):
     """One command for leads: no args lists them, 'add', a status verb, or 'rm'."""
     d = require_engagement()
@@ -2091,6 +2292,7 @@ def _creds_export(d, creds, dest=None):
         print(f"  pth   : netexec smb {tgt} -u <user> -H {out/'hashes.txt'}")
     log_event("creds", f"exported to {out}")
 
+@with_lock
 def cmd_cred(args):
     if args.action in (None, "list", "users", "passwords", "hashes", "export"):
         args.what = None if args.action == "list" else args.action
@@ -2128,6 +2330,7 @@ def cmd_cred(args):
     else:
         info("Already stored")
 
+@with_lock
 def cmd_flag(args):
     d = require_engagement()
     st = load_state(d)
@@ -2151,6 +2354,7 @@ def cmd_flag(args):
     log_event("flag", f"{args.name} on {tgt or '?'}: {value}")
     ok(f"Flag '{args.name}' stored{owned_msg}")
 
+@with_lock
 def cmd_set(args):
     """Project facts you want to keep handy: domain, dc-ip, base-dn, url, ..."""
     d = require_engagement()
@@ -2171,6 +2375,7 @@ def cmd_set(args):
     log_event("fact", f"{args.key} = {val}")
     ok(f"{args.key} = {val}")
 
+@with_lock
 def cmd_focus(args):
     """What you are working on right now, shown on the home screen and in status."""
     d = require_engagement()
@@ -2435,6 +2640,8 @@ def split_segments(text):
             if cur:
                 segs.append(cur)
             cur = _decode_begin(m.group(2))
+            if cur:
+                cur["mark"] = m.group(2)
         elif cur:
             rc, _, end = m.group(2).partition(":")
             cur["rc"] = int(rc) if rc.lstrip("-").isdigit() else None
@@ -2679,8 +2886,10 @@ def _excerpt(text, pos, before=2, after=6):
     return "\n".join(lines[max(0, upto - before):upto + after + 1])[:1200].strip("\n")
 
 def add_command(st, seg, phase, file_rel, hosts, cmd=None):
-    """Record the command that found something (or touched a target); returns its id."""
-    cmd = cmd if cmd is not None else seg.get("cmd")
+    """Record the command that found something (or touched a target); returns its id.
+    A command from a capture also keeps the lines it spans in the recording, for
+    'pentrail show'."""
+    cmd = redact_text(cmd if cmd is not None else seg.get("cmd") or "")[0]
     ts = seg.get("ts")
     stamp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else _now()
     for c in st["commands"]:
@@ -2693,16 +2902,18 @@ def add_command(st, seg, phase, file_rel, hosts, cmd=None):
     dur = int(seg["end"] - ts) if ts and seg.get("end") else None
     st["commands"].append({"id": cid, "cmd": cmd, "prog": prog_of(cmd), "ts": stamp, "dur": dur,
                            "rc": seg.get("rc"), "phase": phase, "file": file_rel,
-                           "hosts": list(hosts), "via": ""})
+                           "hosts": list(hosts), "via": actor(seg.get("via"))})
+    if seg.get("lines"):
+        st["commands"][-1]["lines"] = seg["lines"]
     return cid
 
 def src_str(st, cid, width=70):
-    """'Found by' text: the command and when."""
+    """'Found by' text: the command, when, and who ran it if it was not you."""
     c = next((c for c in st.get("commands", []) if c["id"] == cid), None) if cid else None
     if not c:
         return ""
     cmd = c["cmd"] if len(c["cmd"]) <= width else c["cmd"][:width - 1] + "…"
-    return f"{cmd}  ({c['ts'][:16]})"
+    return f"{cmd}  ({c['ts'][:16]}" + (f", by {c['via']}" if c.get("via") else "") + ")"
 
 def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
     """Merge one command's findings into state. Only what is in scope is kept; every
@@ -2826,13 +3037,67 @@ def apply_findings(d, st, F, ctx, scope, seg, phase, file_rel, n):
             st["facts"][k] = v
             n["facts"] += 1
             log_event("fact", f"{k} = {v} (from {file_rel})", d)
+    return cid
+
+# What makes a command worth an auto-shot: it added one of these
+FOUND = ("ports", "web", "names", "vectors", "creds", "facts")
+
+def auto_shot(d, st, seg, out, phase, cid):
+    """Keep a command that found something as evidence: its command line and output as
+    text, and as a PNG when termshot is installed (rendered in the background, so the
+    capture's prompt comes back at once). Linked from the command record ('shot')."""
+    ts = datetime.fromtimestamp(seg["ts"]) if seg.get("ts") else datetime.now()
+    label = re.sub(r"[^A-Za-z0-9._-]", "-", prog_of(seg["cmd"]) or "cmd")[:16]
+    ev = evidence_dir(d, phase)
+    base = f"{d.name}_{ts:%Y-%m-%d_%H%M%S}_found-{label}"
+    txt, k = ev / f"{base}.txt", 2
+    while txt.exists():                       # two finds in the same second
+        txt, k = ev / f"{base}-{k}.txt", k + 1
+    txt.write_text(f"$ {redact_text(seg['cmd'])[0]}\n{out.strip(chr(10))}\n")
+    shot, renderer = txt, CFG.get("termshot_cmd", "termshot")
+    if shutil.which(renderer):
+        try:
+            subprocess.Popen([renderer, "-f", str(txt.with_suffix(".png")), "--", "cat", str(txt)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            shot = txt.with_suffix(".png")
+        except OSError:
+            pass
+    c = next((c for c in st["commands"] if c["id"] == cid), None) if cid else None
+    if c is not None:
+        c["shot"] = rel(d, shot)
+    log_event("shot", f"found: {seg['cmd']} -> {rel(d, shot)}", d, seg.get("via"))
+    return rel(d, shot)
 
 def new_counts():
     return {k: 0 for k in ("ports", "web", "names", "vectors", "creds", "facts", "skipped", "cmds", "blocked")}
 
-def ingest_recording(d, st, raw, phase, file_rel, quiet=False):
+def _marker_lines(raw, line0=0):
+    """{B marker payload: [first, last]}: the lines of the recording a command spans,
+    from the line it was typed on to the end of its output. 'line0' is the line the
+    chunk starts on. Markers, redaction and decoding never add or drop a newline, so
+    these are also the lines of the saved recording."""
+    out, ln, pos, cur = {}, line0, 0, None
+    for m in _MARK_RE.finditer(raw):
+        ln += raw.count("\n", pos, m.start())
+        pos = m.start()
+        if m.group(1) == "B":                     # printed at the start of the first output line
+            cur = m.group(2)
+            out[cur] = [max(0, ln - 1), ln]
+        elif cur:                                 # E: right after the output, before the prompt
+            at_col0 = m.start() == 0 or raw[m.start() - 1] == "\n"
+            out[cur][1] = max(out[cur][0], ln - 1 if at_col0 else ln)
+            cur = None
+    return out
+
+def ingest_recording(d, st, raw, phase, file_rel, quiet=False, via=None, line0=0, autoshot=False):
     """Parse a recording (or any tool output): redact, drop pentrail's own output,
-    split into commands, read each one, and merge what is in scope into state."""
+    split into commands, read each one, and merge what is in scope into state.
+    'via' credits its commands to someone other than you (see actor()); 'line0' is
+    where 'raw' starts in the recording file. With 'autoshot' (a live capture) and
+    the auto_shot setting on, every command that found something is kept as a shot;
+    their files are in the returned counts as n['shots']."""
+    spans = _marker_lines(raw, line0)
     text = _strip_capture_echo(raw)
     text, nred = redact_text(text)
     if nred and not quiet:
@@ -2840,19 +3105,28 @@ def ingest_recording(d, st, raw, phase, file_rel, quiet=False):
     scope = Scope(d, st)
     env = project_env(d)
     n = new_counts()
+    n["shots"] = []
+    shots = autoshot and cfg_on("auto_shot")
     for seg in split_segments(text):
         typed = seg.get("typed")
         if typed and re.match(r"^\s*(pentrail|exit|clear|cd|ls|ll|pwd)\b", typed):
             continue
         values = dict(env, **seg.get("values", {}))
         seg["cmd"] = expand_vars(typed, values).strip() if typed else None
+        if via:
+            seg["via"] = via
+        if seg.get("mark") in spans:
+            seg["lines"] = spans[seg["mark"]]
         if seg["cmd"] and seg["cmd"].startswith("scope-ok "):
             seg["cmd"] = seg["cmd"][9:]
         out = seg["out"] if seg.get("clean") else clean_terminal(seg["out"])
         ctx = _cmd_context(seg["cmd"], scope)
         if seg["cmd"]:
             n["cmds"] += 1
-        apply_findings(d, st, analyze(out, ctx), ctx, scope, seg, phase, file_rel, n)
+        before = [n[k] for k in FOUND]
+        cid = apply_findings(d, st, analyze(out, ctx), ctx, scope, seg, phase, file_rel, n)
+        if shots and seg["cmd"] and [n[k] for k in FOUND] != before:
+            n["shots"].append(auto_shot(d, st, seg, out, phase, cid))
     save_state(d, st)
     return n
 
@@ -2863,13 +3137,14 @@ def report_counts(n, where="", quiet=False):
     if quiet:
         return bits
     if bits:
-        print(f"\n{B}New:{N} " + ", ".join(bits) + (f"  -> {where}" if where else ""))
+        print(f"\n{G}{SYM['new']} New:{N} " + ", ".join(bits) + (f"  {DIM}{_u('→', '->')} {where}{N}" if where else ""))
     else:
         info("Nothing new - everything was already logged." if n["cmds"] else "No leads parsed.")
     if n["skipped"]:
         print(f"{DIM}    {n['skipped']} item(s) outside the scope were not logged{N}")
     return bits
 
+@with_lock
 def cmd_ingest(args):
     d = require_engagement()
     f = Path(args.file)
@@ -2894,8 +3169,9 @@ def ingest_file(d, st, f, quiet=False):
             pass
     if text.lstrip().startswith("<?xml") and "<nmaprun" in text:
         text = _nmap_xml_as_text(text)
-    if _MARK_RE.search(text):
-        return ingest_recording(d, st, text, st.get("phase", "enum"), rel(d, f), quiet)
+    if _MARK_RE.search(text):          # a capture recording: read as captures are, \r and all
+        return ingest_recording(d, st, f.read_bytes().decode("utf-8", "replace"),
+                                st.get("phase", "enum"), rel(d, f), quiet)
     seg = {"typed": cmd, "ts": ts, "cwd": None, "values": {}, "rc": None, "end": None,
            "out": text, "marked": True}
     scope, n = Scope(d, st), new_counts()
@@ -3123,26 +3399,31 @@ def capture_catchup(quiet=True, wait=False):
     if not m or not process_alive(m.get("pid")):
         return None
     f, d = Path(m["file"]), Path(m["eng"])
-    start = int(m.get("parsed", 0))
     data = b""
     for _ in range(25 if wait else 1):          # the E marker may still be in flight
         try:
             data = f.read_bytes()
         except OSError:
             return None
-        if data.rfind(b"\x1b_pentrail:E:") >= start:
+        if data.rfind(b"\x1b_pentrail:E:") >= int(m.get("parsed", 0)):
             break
         time.sleep(0.02)
-    last = data.rfind(b"\x1b_pentrail:E:")
-    close = data.find(b"\x1b\\", last) if last >= start else -1
-    if close < 0:
-        return None
-    end = close + 2
-    m["parsed"] = end
-    _write_marker(m)
-    st = load_state(d)
-    return ingest_recording(d, st, data[start:end].decode("utf-8", "replace"),
-                            m.get("phase", "enum"), rel(d, f), quiet=True), d
+    with locked(d):
+        m = _read_marker()                      # fresh: another catch-up may have read on
+        if not m or str(Path(m.get("file", ""))) != str(f):
+            return None
+        start = int(m.get("parsed", 0))
+        last = data.rfind(b"\x1b_pentrail:E:")
+        close = data.find(b"\x1b\\", last) if last >= start else -1
+        if close < 0:
+            return None
+        end = close + 2
+        m["parsed"] = end
+        _write_marker(m)
+        st = load_state(d)
+        return ingest_recording(d, st, data[start:end].decode("utf-8", "replace"),
+                                m.get("phase", "enum"), rel(d, f), quiet=True,
+                                line0=data.count(b"\n", 0, start), autoshot=True), d
 
 def hook_main(argv):
     """Entry point for the capture shell hook ('pentrail _hook check|end')."""
@@ -3169,7 +3450,9 @@ def hook_main(argv):
             n, d = res
             bits = report_counts(n, quiet=True)
             if bits:
-                print(f"\033[2m[pentrail] +{', +'.join(bits)} -> docs updated\033[0m")
+                print(f"\033[2m{SYM['new']} pentrail: {', '.join(bits)} {_u('→', '->')} docs updated\033[0m")
+            for s in n.get("shots", []):
+                print(f"\033[35m{SYM['shot']}\033[0m\033[2m evidence: {s}\033[0m")
         return 0
     return 0
 
@@ -3181,12 +3464,13 @@ def cmd_capture(args):
     if inside:
         die(f"You're inside capture '{inside}'. Type 'exit' to close it, then run "
             f"'pentrail capture {args.label or ''}'.".rstrip())
-    st = load_state(d)
-    phase = phase_of(args.label) if args.label else None
-    if phase and phase != st.get("phase"):
-        st["phase"] = phase
-        save_state(d, st)
-        log_event("phase", phase)
+    with locked(d):
+        st = load_state(d)
+        phase = phase_of(args.label) if args.label else None
+        if phase and phase != st.get("phase"):
+            st["phase"] = phase
+            save_state(d, st)
+            log_event("phase", phase)
     phase = phase or st.get("phase", "enum")
     lbl = re.sub(r"[^A-Za-z0-9._-]", "-", args.label) if args.label else phase
 
@@ -3209,97 +3493,107 @@ def cmd_capture(args):
     env = dict(os.environ, PENTRAIL_CAPTURE=lbl, **project_env(d))
     extra, env, hooked = capture_shell(env, getattr(args, "plain", False))
     scope = Scope(d, st)
-    info(f"Recording '{lbl}' (phase {phase}) to {rel(d, f)}")
     guard = getattr(args, "guard", None) or guard_mode()
+    rows = [f"{DIM}file {N}  {rel(d, f)}"]
     if hooked and scope.defined:
-        print(f"    scope guard {guard}: {GUARD_TEXT[guard]}"
-              + (" (this capture)" if getattr(args, "guard", None) else ""))
-        print(f"    {scope.summary()}")
-        print(f"    {DIM}switch while you work: pentrail scope guard strict|warn|off{N}")
+        rows += [f"{DIM}guard{N}  {guard}: {GUARD_TEXT[guard]}" + (" (this capture)" if getattr(args, "guard", None) else ""),
+                 f"{DIM}scope{N}  {scope.summary()}"]
     elif hooked:
-        print(f"    {Y}no scope set{N}: nothing is blocked (pentrail scope add <host>)")
+        rows.append(f"{DIM}scope{N}  {Y}no scope set{N}: nothing is blocked (pentrail scope add <host>)")
     else:
-        print(f"    {Y}plain recording{N}: no scope guard and no per-command tracking "
-              f"({'--plain' if getattr(args, 'plain', False) else 'needs bash or zsh'})")
-    print(f"{DIM}    work as usual; type 'exit' when done. $TARGET is set. "
-          f"'pentrail shot --last' screenshots what you just ran.{N}")
+        rows.append(f"{DIM}mode {N}  {Y}plain recording{N}: no scope guard, no per-command tracking "
+                    f"({'--plain' if getattr(args, 'plain', False) else 'needs bash or zsh'})")
+    rows.append(f"{DIM}shots{N}  " + (f"{M}{SYM['shot']}{N} auto-shot on: a command that finds something is kept as a screenshot"
+                                      if hooked and cfg_on("auto_shot") else
+                                      f"pentrail shot --last keeps what you just ran {DIM}(automatic: pentrail config auto_shot on){N}"))
+    rows.append(f"{DIM}done {N}  type 'exit'  {DIM}{SYM['dot']} $TARGET is set {SYM['dot']} guard: pentrail scope guard strict|warn|off{N}")
+    box(f"{R}{_u('●', '*')}{N}{BOLD} REC  {lbl}{N} {DIM}phase {phase}{N}", rows, R)
     log_event("capture", f"started {lbl} ({rel(d, f)})")
     started = _now()
 
     sys.stdout.flush()
     proc = subprocess.Popen(["script", "-q", "-f", *extra, str(f)], env=env)
     _write_marker({"pid": proc.pid, "label": lbl, "file": str(f), "eng": str(d),
-                   "phase": phase, "parsed": 0, "guard": getattr(args, "guard", None)})
+                   "phase": phase, "parsed": 0, "guard": getattr(args, "guard", None),
+                   "by": actor()})
     proc.wait()
-    m2 = _read_marker() or {}
-    start = int(m2.get("parsed", 0)) if m2.get("pid") == proc.pid else 0
-    if m2.get("pid") == proc.pid:
-        CAPTURE_MARKER.unlink(missing_ok=True)
+    with locked(d):                             # no catch-up may run while this one ends
+        m2 = _read_marker() or {}
+        start = int(m2.get("parsed", 0)) if m2.get("pid") == proc.pid else 0
+        if m2.get("pid") == proc.pid:
+            CAPTURE_MARKER.unlink(missing_ok=True)
 
-    data = f.read_bytes() if f.exists() else b""
-    tail = data[start:].decode("utf-8", "replace")
-    # the saved evidence: your own secrets scrubbed, invisible markers removed
-    raw = data.decode("utf-8", "replace")
-    clean, nred = redact_text(raw)
-    saved = strip_markers(clean)
-    if saved != raw:
-        f.write_text(saved)
-    if nred:
-        warn(f"Scrubbed {nred} of your own secret(s) from {f.name} before saving.")
-    ok(f"Recording saved: {rel(d, f)}")
-    st = load_state(d)
-    log_event("capture", f"ended {lbl} ({rel(d, f)})")
-    n = ingest_recording(d, st, tail, phase, rel(d, f))
-    auto_ingest_scans(d, st)
-    cmds = sum(1 for c in st["commands"] if c.get("file") == rel(d, f))
+        data = f.read_bytes() if f.exists() else b""
+        tail = data[start:].decode("utf-8", "replace")
+        # the saved evidence: your own secrets scrubbed, invisible markers removed
+        raw = data.decode("utf-8", "replace")
+        clean, nred = redact_text(raw)
+        saved = strip_markers(clean)
+        if saved != raw:
+            f.write_text(saved)
+        if nred:
+            warn(f"Scrubbed {nred} of your own secret(s) from {f.name} before saving.")
+        ok(f"Recording saved: {rel(d, f)}")
+        st = load_state(d)
+        log_event("capture", f"ended {lbl} ({rel(d, f)})")
+        n = ingest_recording(d, st, tail, phase, rel(d, f), line0=data.count(b"\n", 0, start), autoshot=True)
+        auto_ingest_scans(d, st)
+    mine = [c for c in st["commands"] if c.get("file") == rel(d, f)]
     blocked = sum(1 for l in _read(d / "logbook.md").splitlines()
                   if "`scope   ` blocked" in l and l[2:21] >= started)
-    info(f"{cmds} command(s) on targets recorded" + (f", {blocked} blocked by the scope guard" if blocked else ""))
+    shots = [c["shot"] for c in mine if c.get("shot")]
+    info(f"{len(mine)} command(s) on targets recorded" + (f", {blocked} blocked by the scope guard" if blocked else ""))
+    if shots:
+        print(f"{M}{SYM['shot']}{N} {len(shots)} auto-shot(s) of commands that found something, in "
+              f"{os.path.dirname(shots[0])}/")
     report_counts(n, f"{PHASE_DIRS['enum']}/enum.md")
 
-def _shot_save(d, label, display, source, phase, cmd=None):
+def _shot_save(d, label, display, source, phase, cmd=None, by="", quiet=False):
     """Render text to a PNG via termshot, save text + png as evidence, log, redact,
-    and parse for leads. Shared by 'shot <cmd>' and 'shot --last'."""
+    and parse for leads. Shared by 'shot <cmd>' and 'shot --last'. 'by' is who ran
+    it; quiet prints only 'Saved:' and the summary."""
     ts = datetime.now()
     label = re.sub(r"[^A-Za-z0-9._-]", "-", label or "shot")[:24]
     base = f"{d.name}_{ts:%Y-%m-%d_%H%M%S}_{label}"
     ev = evidence_dir(d, phase)
     png, txt = ev / f"{base}.png", ev / f"{base}.txt"
     display, nred = redact_text(strip_markers(display))
-    if nred:
+    if nred and not quiet:
         warn(f"Redacted {nred} of your own secret(s) from the shot.")
     txt.write_text(display)
     renderer = CFG.get("termshot_cmd", "termshot")
     made = False
+    say = (lambda m: None) if quiet else warn
     if shutil.which(renderer):
         try:
             subprocess.run([renderer, "-f", str(png), "--", "cat", str(txt)],
                            capture_output=True, text=True, timeout=60)
             made = png.exists()
         except (OSError, subprocess.TimeoutExpired) as e:
-            warn(f"{renderer} failed: {e}")
+            say(f"{renderer} failed: {e}")
         if not made:
-            warn(f"{renderer} produced no image; kept the text evidence.")
+            say(f"{renderer} produced no image; kept the text evidence.")
     else:
-        warn(f"'{renderer}' not installed: saved text evidence only. For PNG screenshots "
-             "install termshot (github.com/homeport/termshot), or point "
-             "'pentrail config termshot_cmd <cmd>' at another renderer.")
-    log_event("shot", f"{source} -> {rel(d, png if made else txt)}")
+        say(f"'{renderer}' not installed: saved text evidence only. For PNG screenshots "
+            "install termshot (github.com/homeport/termshot), or point "
+            "'pentrail config termshot_cmd <cmd>' at another renderer.")
+    log_event("shot", f"{source} -> {rel(d, png if made else txt)}", d, by)
     ok(f"Saved: {rel(d, png if made else txt)}")
-    st = load_state(d)
-    if cmd:
-        seg = {"typed": cmd, "cmd": cmd, "ts": ts.timestamp(), "values": {}, "rc": None,
-               "end": None, "out": display, "marked": True}
-        scope, n = Scope(d, st), new_counts()
-        ctx = _cmd_context(cmd, scope)
-        apply_findings(d, st, analyze(clean_terminal(display), ctx), ctx, scope, seg, phase,
-                       rel(d, png if made else txt), n)
-        save_state(d, st)
-    else:
-        n = ingest_recording(d, st, display, phase, rel(d, png if made else txt), quiet=True)
+    with locked(d):
+        st = load_state(d)
+        if cmd:
+            seg = {"typed": cmd, "cmd": cmd, "ts": ts.timestamp(), "values": {}, "rc": None,
+                   "end": None, "out": display, "marked": True, "via": by}
+            scope, n = Scope(d, st), new_counts()
+            ctx = _cmd_context(cmd, scope)
+            apply_findings(d, st, analyze(clean_terminal(display), ctx), ctx, scope, seg, phase,
+                           rel(d, png if made else txt), n)
+            save_state(d, st)
+        else:
+            n = ingest_recording(d, st, display, phase, rel(d, png if made else txt), quiet=True, via=by)
     report_counts(n)
 
-def _shot_last(d, args):
+def _shot_last(d, args, quiet=False, by=""):
     """Screenshot recent output of the active capture (the task you just ran)."""
     m = _read_marker()
     if not (m and process_alive(m.get("pid"))):
@@ -3318,42 +3612,61 @@ def _shot_last(d, args):
     chunk = "\n".join(lines).strip("\n")
     if not chunk.strip():
         die("Nothing new in the capture to screenshot yet.")
-    m["shot_offset"] = len(data)            # next --last starts here
-    _write_marker(m)
+    with locked(d):                         # keep what a catch-up wrote to the marker meanwhile
+        fresh = _read_marker() or m
+        fresh["shot_offset"] = len(data)    # next --last starts here
+        _write_marker(fresh)
     _shot_save(d, args.label or m.get("label", "snap"), chunk,
-               f"capture {m.get('label', '')} tail", m.get("phase", "enum"))
+               f"capture {m.get('label', '')} tail", m.get("phase", "enum"), by=by, quiet=quiet)
 
 def cmd_shot(args):
     """Terminal screenshot as evidence: run a command and shoot its output, or
-    shoot the recent output of an active capture with --last."""
+    shoot the recent output of an active capture with --last. -q keeps it to
+    'Saved:' and the summary and exits with the tool's own exit code; exit 3 is
+    kept for 'blocked by the scope guard'."""
     d = require_engagement()
+    quiet, by = getattr(args, "quiet", False), actor(getattr(args, "by", None))
     if getattr(args, "last", None) is not None:
-        return _shot_last(d, args)
+        return _shot_last(d, args, quiet, by)
     cmd = list(args.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        die("Usage: pentrail shot [-l label] <command ...>   |   pentrail shot --last [lines]")
+        die("Usage: pentrail shot [-q] [--by name] [-l label] <command ...>   |   pentrail shot --last [lines]")
     st = load_state(d)
     line = " ".join(shlex.quote(c) for c in cmd)
-    allowed, msgs = scope_gate(d, st, line, cwd=os.getcwd())
+    allowed, msgs = scope_gate(d, st, line, cwd=os.getcwd(), by=by)
     for m in msgs:
-        (warn if allowed else err)(m)
+        if not allowed:
+            err(m)
+        elif quiet:                      # scope news is never swallowed, but keeps off stdout
+            print(f"{Y}{SYM['warn']}{N} {m}", file=sys.stderr)
+        else:
+            warn(m)
     if not allowed:
         sys.exit(3)
-    info(f"Running: {' '.join(cmd)}")
+    if not quiet:
+        info(f"Running: {' '.join(cmd)}")
     env = dict(os.environ, FORCE_COLOR="1", CLICOLOR_FORCE="1")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    except FileNotFoundError:
-        die(f"Command not found: {cmd[0]}")
-    except OSError as e:
-        die(f"Could not run {cmd[0]}: {e}")
-    raw = (proc.stdout or "") + (proc.stderr or "")
-    if raw:
-        print(raw if raw.endswith("\n") else raw + "\n", end="")
-    _shot_save(d, args.label or cmd[0], f"$ {' '.join(cmd)}\n{raw}", " ".join(cmd),
-               st.get("phase", "enum"), cmd=" ".join(cmd))
+    _running_mark(d, {"cmd": redact_text(" ".join(cmd))[0], "via": by, "since": _now(),
+                      "source": "shot", "label": args.label or cmd[0]})
+    try:                                 # 'seen' and 'trace' show it as running meanwhile
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env)
+        except FileNotFoundError:
+            die(f"Command not found: {cmd[0]}")
+        except OSError as e:
+            die(f"Could not run {cmd[0]}: {e}")
+        raw = (proc.stdout or "") + (proc.stderr or "")
+        if raw and not quiet:
+            print(raw if raw.endswith("\n") else raw + "\n", end="")
+        _shot_save(d, args.label or cmd[0], f"$ {' '.join(cmd)}\n{raw}", " ".join(cmd),
+                   st.get("phase", "enum"), cmd=" ".join(cmd), by=by, quiet=quiet)
+    finally:
+        _running_mark(d, None)
+    rc = proc.returncode
+    if quiet and rc:                     # a signal is 128+n, as in the shell; a tool's 3 is 1
+        sys.exit(1 if rc == 3 else 128 - rc if rc < 0 else rc)
 
 # ----------------------------------------------------------------------------- working docs
 # Each phase folder has a Markdown doc you write in. Blocks between
@@ -3388,7 +3701,32 @@ SCOPE_TEMPLATE = """# Scope - {name}
 - Test accounts:
 - Not allowed:
 - Contact:
-{derived}"""
+{rules}{derived}"""
+
+# The PeTe rules: what an AI assistant (PeTe, the AI layer in ai/claude/) may run in a
+# project on its own. ai/claude/rules.md carries the same block; 'pentrail config
+# pete_rules on' puts it into new projects without the AI layer.
+RULES_BLOCK = """<!-- pentrail:rules -->
+### PeTe rules (AI assistant)
+<!-- What an AI assistant (PeTe) may run here on its own. allow = after one "go" from
+     you per round, ask = its own yes every time, deny = never. Change the word after
+     the colon to change a rule. -->
+- passive_recon: allow - public sources only: DNS records, certificate logs, archives
+- port_scan: allow - nmap, rustscan, masscan against in-scope hosts
+- max_scan_rate: 1000 - packets per second at most (nmap --max-rate, masscan --rate)
+- service_enum: allow - versions, banners, safe NSE scripts, anonymous and null-session checks
+- web_content_discovery: allow - ffuf, feroxbuster, gobuster, vhost fuzzing, crawling
+- vuln_scripts: ask - nmap --script vuln, nikto, nuclei: probes for known flaws
+- credentialed_enum: ask - enumeration with credentials you hand to PeTe
+- root_commands: ask - anything that needs sudo (UDP and SYN scans)
+- brute_force: deny - guessing passwords or default logins against a service
+- password_spraying: deny - trying one password on many accounts
+- exploitation: deny - PeTe stops at the finding; exploiting it is yours to decide
+- dos: deny - anything that may slow down or crash a service
+- fast_mode: off - on: a one-line plan is enough when every step is allow
+<!-- pentrail:end rules -->
+"""
+RULES_RE = re.compile(r"<!-- pentrail:rules -->.*?<!-- pentrail:end rules -->\n?", re.S)
 
 SCOPE_DERIVED = """
 ## Resolved into the scope
@@ -3558,7 +3896,8 @@ def ensure_docs(d, scope_assets=()):
     name = d.name
     make = {
         "scope": lambda: SCOPE_TEMPLATE.format(
-            name=name, in_lines="".join(f"- {a}\n" for a in scope_assets), derived=SCOPE_DERIVED),
+            name=name, in_lines="".join(f"- {a}\n" for a in scope_assets), derived=SCOPE_DERIVED,
+            rules="\n" + RULES_BLOCK if cfg_on("pete_rules") else ""),
         "enum": lambda: ENUM_TEMPLATE.format(
             name=name, note=AUTO_NOTE, overview=_auto("overview"), names=_auto("names"),
             commands=_auto("commands enum")),
@@ -3601,7 +3940,7 @@ def _src_md(st, cid):
     if not c:
         return ""
     cmd = c["cmd"] if len(c["cmd"]) <= 90 else c["cmd"][:89] + "…"
-    return f"`{cmd}` ({c['ts'][:16]})"
+    return f"`{cmd}` ({c['ts'][:16]}" + (f", by {c['via']}" if c.get("via") else "") + ")"
 
 def render_ports(st, h):
     if not h["ports"]:
@@ -3668,10 +4007,13 @@ def render_commands(st, phase=None):
     cs = [c for c in st["commands"] if phase is None or c.get("phase") == phase]
     if not cs:
         return "_none yet_"
-    rows = ["| Time | Host | Command | Exit | Recording |", "|---|---|---|---|---|"]
+    who = any(c.get("via") for c in cs)       # a By column once someone else ran something
+    rows = ["| Time | Host | Command |" + (" By |" if who else "") + " Exit | Recording |",
+            "|---|---|---|" + ("---|" if who else "") + "---|---|"]
     for c in cs:
         rows.append(f"| {c['ts'][:16]} | {_cell(', '.join(c.get('hosts', [])[:2]))} | `{_cell(c['cmd'])}` | "
-                    f"{'' if c.get('rc') is None else c['rc']} | {_cell(c.get('file'))} |")
+                    + (f"{_cell(c.get('via'))} | " if who else "")
+                    + f"{'' if c.get('rc') is None else c['rc']} | {_cell(c.get('file'))} |")
     return "\n".join(rows)
 
 def render_evidence(d, phase):
@@ -3839,6 +4181,7 @@ def render_host_notes(st, h, L):
             f"[N{n['id']}](../{NOTES_DOC}#{_notes_anchor(L, n.get('host'))})" for n in men))
     return "\n".join(lines) or '_none yet: pentrail note "<text>"_'
 
+@with_lock
 def cmd_note(args):
     """A quick note on the active box (or -t <host>, or -t none for the project)."""
     d = require_engagement()
@@ -3864,6 +4207,7 @@ def cmd_note(args):
     ok(f"Note N{nid}" + (f" on {host}" if host else " (project)") + f" -> {NOTES_DOC}"
        + (", 1-enum/enum.md" if host else ""))
 
+@with_lock
 def cmd_notes(args):
     """List notes (all, or for one host), remove one, or change its text."""
     d = require_engagement()
@@ -4009,6 +4353,8 @@ def create_finding(d, st, title, vec=None, sev=None):
         steps.append(f"1. Run:\n\n   ```\n   {c['cmd']}\n   ```\n\n   <!-- recorded {c['ts']} in {c.get('file')} -->")
         if c.get("file"):
             evidence.append(f"- `{c['file']}` (recording, {c['ts'][:16]})")
+        if c.get("shot"):
+            evidence.append(f"- `{c['shot']}` (screenshot of the command and its output)")
     if vec and vec.get("excerpt"):
         steps.append("2. Output:\n\n```text\n" + vec["excerpt"].strip("\n") + "\n```")
     if not steps:
@@ -4026,6 +4372,7 @@ def clean_md(text):
     text = re.sub(r"<!--.*?-->\n?", "", text, flags=re.S)
     return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
 
+@with_lock
 def cmd_finding(args):
     """List findings, create one from a vector or a title, or print one clean."""
     d = require_engagement()
@@ -4126,7 +4473,8 @@ def build_report(d, st, mask=False):
         sc += ["**In scope**", ""] + [f"- {e['raw']}" for e in scope.inc]
         if scope.exc:
             sc += ["", "**Out of scope**", ""] + [f"- {e['raw']}" for e in scope.exc]
-        rules = re.search(r"^## Rules of engagement\n(.*?)(?=^## |\Z)", _read(d / SCOPE_DOC) + "\n", re.S | re.M)
+        rules = re.search(r"^## Rules of engagement\n(.*?)(?=^## |\Z)",      # not the PeTe rules
+                          RULES_RE.sub("", _read(d / SCOPE_DOC)) + "\n", re.S | re.M)
         filled = [l for l in (rules.group(1).splitlines() if rules else []) if re.search(r":[ \t]*\S", l)]
         if filled:
             sc += ["", "**Rules of engagement**", ""] + filled
@@ -4193,11 +4541,12 @@ def build_report(d, st, mask=False):
 def cmd_report(args):
     """Fill 5-report/report.md from the docs and findings; optionally export it."""
     d = require_engagement()
-    st = load_state(d)
-    auto_ingest_scans(d, st)
-    sync_docs(d, st)
-    f, fs = build_report(d, st, mask=args.mask)
-    log_event("report", f"updated {rel(d, f)}" + (" (masked)" if args.mask else ""))
+    with locked(d):                         # not held for the HTML/PDF export below
+        st = load_state(d)
+        auto_ingest_scans(d, st)
+        sync_docs(d, st)
+        f, fs = build_report(d, st, mask=args.mask)
+        log_event("report", f"updated {rel(d, f)}" + (" (masked)" if args.mask else ""))
     ok(f"Report updated: {rel(d, f)}")
     print(f"    {len(st['hosts'])} hosts, {len(fs)} findings, {len(st['vectors'])} leads, "
           f"{len(st['commands'])} recorded commands. Your own text in it is kept.")
@@ -4408,53 +4757,327 @@ def web_steps(scheme, port, t):
     return steps
 
 DIRBUSTERS = ("feroxbuster", "ffuf", "gobuster", "dirsearch", "dirb", "wfuzz")
+# Tools that count as one when pentrail asks "was this already run?"
+TOOL_GROUPS = (frozenset(DIRBUSTERS), frozenset(("netexec", "nxc", "crackmapexec", "cme")),
+               frozenset(("enum4linux", "enum4linux-ng")))
+
+def _tool_group(name):
+    n = (name or "").lower()
+    return next((g for g in TOOL_GROUPS if n in g), frozenset((n,)))
 
 def _latest_scan(d):
     files = [f for sd in scan_dirs(d) for f in sd.iterdir() if f.is_file()]
     return max(files, key=lambda p: p.stat().st_mtime, default=None)
+
+def _web_scheme(p):
+    """'http' or 'https' for a port that serves the web, else None."""
+    port, svc = p["port"], p["service"] or "unknown"
+    key = svc if (svc in PLAYBOOK or svc in ("http", "https")) else PORT_FALLBACK.get(port, svc)
+    if key in ("http", "https", "ssl/http", "http-proxy"):
+        return "https" if ("https" in key or "ssl" in svc or port in (443, 8443)) else "http"
+    return None
 
 def _host_steps(h):
     """[(port, service, [step, ...])] for a host's open ports."""
     out = []
     for p in sorted(h["ports"], key=lambda p: p["port"]):
         port, svc = p["port"], p["service"] or "unknown"
-        key = svc if (svc in PLAYBOOK or svc in ("http", "https")) else PORT_FALLBACK.get(port, svc)
-        if key in ("http", "https", "ssl/http", "http-proxy"):
-            scheme = "https" if ("https" in key or "ssl" in svc or port in (443, 8443)) else "http"
+        scheme = _web_scheme(p)
+        if scheme:
             steps = web_steps(scheme, port, h["ip"])
         else:
+            key = svc if svc in PLAYBOOK else PORT_FALLBACK.get(port, svc)
             steps = [s.format(t=h["ip"], p=port, h=h["ip"]) for s in PLAYBOOK.get(key, [])]
         out.append((port, svc, steps))
     return out
 
-def _step_done(st, host, step, legacy=""):
+# --- which recorded commands ran against a host --------------------------------------
+_RANGE_HINT = re.compile(r"\d/\d|\d-\d")
+
+@functools.lru_cache(maxsize=1024)
+def _word_re(k):
+    """A host as a whole word: 10.10.10.5 is not found inside 10.10.10.50."""
+    return re.compile(r"(?<![\w.-])%s(?![\w-]|\.\w)" % re.escape(k), re.I)
+
+def _host_keys(st, host):
+    """(the tracked host or None, the lowercase addresses and names it goes by)."""
+    h = _find_host(st, host)
+    if not h:
+        return None, {host.lower()}
+    return h, {k.lower() for k in (h["ip"], *h.get("aliases", []))}
+
+def _targets_host(targets, keys, ip):
+    """Does a command line's target list (from hosts_in_command) take in the host?"""
+    ipo = _ip_obj(ip) if ip else None
+    def has(t):
+        if t["host"].lower() in keys:
+            return True
+        if ipo is None:
+            return False
+        if t["net"] is not None:
+            return t["net"].version == ipo.version and ipo in t["net"]
+        return bool(t["range"]) and ipo.version == 4 and t["range"][0] <= int(ipo) <= t["range"][1]
+    if any(has(t) for t in targets if t["excluded"]):
+        return False
+    return any(has(t) for t in targets if not t["excluded"] and not t["header"])
+
+def _cmd_on_host(c, keys, ip=None):
+    """Did a recorded (or running) command run against this host: among its targets,
+    named in its command line as a whole word, or inside a network or range it
+    scanned and did not leave out with --exclude."""
+    cmd = c.get("cmd") or ""
+    if "exclude" in cmd or " -eh" in cmd:              # rare: decide from the command line
+        return _targets_host(hosts_in_command(cmd), keys, ip)
+    if keys & {x.lower() for x in c.get("hosts", [])}:
+        return True
+    if any(_word_re(k).search(cmd) for k in keys):
+        return True
+    return bool(ip) and bool(_RANGE_HINT.search(cmd)) and _targets_host(hosts_in_command(cmd), keys, ip)
+
+def _host_cmds(st, host):
+    """The recorded commands that ran against a host."""
+    h, keys = _host_keys(st, host)
+    ip = h["ip"] if h else host
+    return [c for c in st["commands"] if _cmd_on_host(c, keys, ip)]
+
+def _step_hits(st, host, step, cmds=None):
+    """The recorded commands that did a 'next' step on a host: the same tool (the
+    dirbusters count as one), and for nmap the same NSE script."""
     tool = re.split(r"[ /]", step.strip())[0].lower()
     if tool.startswith("check"):
-        return False
+        return []
     script = re.search(r"--script\s+([\w-]+)", step) if tool == "nmap" else None
-    for c in st["commands"]:
-        if host not in c.get("hosts", []) and host not in c["cmd"]:
-            continue
+    group = _tool_group(tool)
+    out = []
+    for c in _host_cmds(st, host) if cmds is None else cmds:
         if tool == "nmap":
             if script and script.group(1) in c["cmd"]:
-                return True
-        elif c.get("prog") == tool or (tool in DIRBUSTERS and c.get("prog") in DIRBUSTERS):
-            return True
-    return bool(legacy) and tool in legacy      # projects from before 1.2: tool named in the logbook
+                out.append(c)
+        elif c.get("prog") in group:
+            out.append(c)
+    return out
+
+def _step_done(st, host, step, legacy="", cmds=None):
+    tool = re.split(r"[ /]", step.strip())[0].lower()
+    if _step_hits(st, host, step, cmds):
+        return True
+    # projects from before 1.2: tool named in the logbook
+    return bool(legacy) and not tool.startswith("check") and tool in legacy
 
 def enum_steps(st, h, legacy=""):
-    items = []
+    items, cmds = [], _host_cmds(st, h["ip"])
     for port, svc, steps in _host_steps(h):
         for s in steps:
-            items.append((f"{port}/{svc}: {s}", _step_done(st, h["ip"], s, legacy)))
+            items.append((f"{port}/{svc}: {s}", _step_done(st, h["ip"], s, legacy, cmds)))
     return items
 
+# --- coverage checks, next to the per-port playbook ----------------------------------
+# The scans that find what the per-port steps cannot see: ports outside nmap's top
+# 1000, versions of ports a fast scan found, UDP services, virtual hosts.
+COVERAGE = {"full-tcp": "Full TCP port scan",
+            "versions": "Service versions (-sV) on every open TCP port",
+            "udp": "UDP top ports",
+            "vhosts": "Virtual hosts on the web server"}
+
+def _scan_types(words):
+    """nmap scan type letters: -sS -sU -sCV -> {'S', 'U', 'C', 'V'}."""
+    return {ch for w in words if re.fullmatch(r"-s[A-Za-z]+", w) for ch in w[2:]}
+
+def _port_list(words):
+    """The -p of an nmap/masscan/naabu command line: None (default ports), 'all', or a
+    set of TCP ports."""
+    spec = None
+    for i, w in enumerate(words):
+        if w in ("-p", "--ports") and i + 1 < len(words):
+            spec = words[i + 1]
+        elif w.startswith("--ports="):
+            spec = w[8:]
+        elif w.startswith("-p") and not w.startswith("--"):
+            spec = w[2:]
+    if spec is None:
+        return None
+    ports = set()
+    for item in spec.split(","):
+        if item[:2] in ("U:", "S:"):                   # UDP / SCTP ports
+            continue
+        item = item[2:] if item.startswith("T:") else item
+        lo, dash, hi = item.partition("-")
+        try:
+            if dash:
+                a, b = int(lo or 1), int(hi or 65535)
+                if a <= 1 and b >= 65535:
+                    return "all"
+                ports.update(range(a, b + 1))
+            else:
+                ports.add(int(item))
+        except ValueError:
+            continue
+    return ports
+
+def _is_full_tcp(c):
+    words, prog = _words(c.get("cmd") or ""), c.get("prog")
+    if prog == "rustscan":                             # all ports unless told otherwise
+        line = " " + " ".join(words)
+        return not re.search(r"\s(?:-p|--ports|--top|-r|--range)\b", line) or \
+            bool(re.search(r"\s(?:-r|--range)[ =]?[01]-65535\b", line))
+    if prog not in ("nmap", "masscan", "naabu"):
+        return False
+    types = _scan_types(words)
+    if "U" in types and not types & set("STAWMNFX"):   # a UDP-only scan
+        return False
+    return _port_list(words) == "all"
+
+def _is_sv(c):
+    words = _words(c.get("cmd") or "")
+    return c.get("prog") == "nmap" and ("-A" in words or "V" in _scan_types(words))
+
+def _is_udp(c):
+    prog = c.get("prog")
+    if prog == "nmap":
+        return "U" in _scan_types(_words(c.get("cmd") or ""))
+    return (prog == "masscan" and "U:" in (c.get("cmd") or "")) or prog == "udp-proto-scanner"
+
+def _is_vhost_fuzz(c):
+    cmd, prog = c.get("cmd") or "", c.get("prog")
+    if prog == "gobuster":
+        return "vhost" in _words(cmd)
+    return prog in ("ffuf", "wfuzz") and bool(re.search(r"Host:\s*\S*FUZZ", cmd, re.I))
+
+COVERAGE_TEST = {"full-tcp": _is_full_tcp, "versions": _is_sv, "udp": _is_udp, "vhosts": _is_vhost_fuzz}
+
+def _covers_port(c, port):
+    pl = _port_list(_words(c.get("cmd") or ""))
+    return pl == "all" or (isinstance(pl, set) and port in pl)
+
+def _dns_wordlist():
+    """A subdomain list for vhost fuzzing, from the SecLists your 'wordlist' is in."""
+    m = re.match(r"(.*?/seclists)/", CFG.get("wordlist", ""), re.I)
+    return (m.group(1) if m else "/usr/share/seclists") + "/Discovery/DNS/subdomains-top1million-5000.txt"
+
+def _vhost_domain(st, h):
+    """The domain to fuzz virtual hosts under: the project's domain when the host has a
+    name in it, else the host's shortest name ('' while it has none)."""
+    names = sorted({*h.get("aliases", []), *(n["name"] for n in st["names"] if n.get("ip") == h["ip"])},
+                   key=len)
+    if _ip_obj(h["ip"]) is None:
+        names.insert(0, h["ip"])
+    dom = str((st.get("facts") or {}).get("domain", "")).lower()
+    if dom and any(n == dom or n.endswith("." + dom) for n in names):
+        return dom
+    return names[0] if names else ""
+
+def coverage(st, h, cmds=None):
+    """[(id, title, step, done, [command ids])]: the coverage checks for one host."""
+    ip = h["ip"]
+    cmds = _host_cmds(st, ip) if cmds is None else cmds
+    def ids(cs):
+        return [c["id"] for c in cs]
+    hits = [c for c in cmds if _is_full_tcp(c)]
+    out = [("full-tcp", COVERAGE["full-tcp"], f"nmap -p- --min-rate 2000 -oN 1-enum/scans/allports_{ip}.txt {ip}",
+            bool(hits), ids(hits))]
+    tcp = sorted(p["port"] for p in h["ports"] if p["proto"] == "tcp")
+    if tcp:
+        by_id = {c["id"]: c for c in st["commands"]}
+        sv = [c for c in cmds if _is_sv(c)]
+        def covered(p):
+            first = by_id.get(p.get("by"))       # the scan that found it ran -sV
+            return bool(p.get("version")) or bool(first and _is_sv(first)) or \
+                any(_covers_port(c, p["port"]) for c in sv)
+        todo = sorted(p["port"] for p in h["ports"] if p["proto"] == "tcp" and not covered(p))
+        out.append(("versions", COVERAGE["versions"],
+                    f"nmap -sC -sV -p{','.join(map(str, todo or tcp))} -oN 1-enum/scans/services_{ip}.txt {ip}",
+                    not todo, ids(sv)))
+    else:
+        out.append(("versions", "Initial scan: top ports with versions and default scripts",
+                    f"nmap -sC -sV -oN 1-enum/scans/initial_{ip}.txt {ip}", False, []))
+    hits = [c for c in cmds if _is_udp(c)]
+    out.append(("udp", COVERAGE["udp"], f"sudo nmap -sU --top-ports 100 -oN 1-enum/scans/udp_{ip}.txt {ip}",
+                bool(hits), ids(hits)))
+    web = [(p["port"], _web_scheme(p)) for p in sorted(h["ports"], key=lambda p: p["port"]) if _web_scheme(p)]
+    if web:
+        port, scheme = next((w for w in web if w[0] in (80, 443)), web[0])
+        dom = _vhost_domain(st, h)
+        hits = [c for c in cmds if _is_vhost_fuzz(c)]
+        out.append(("vhosts", COVERAGE["vhosts"],
+                    f"ffuf -u {scheme}://{ip}:{port}/ -H 'Host: FUZZ.{dom or '<domain>'}' -w {_dns_wordlist()} -ac"
+                    + ("" if dom else "   # find the domain first: redirects, certificates"),
+                    bool(hits), ids(hits)))
+    return out
+
+def _next_up(d, st, h=None):
+    """The one step to suggest first for the active box (or h): the full port scan if it
+    is missing, else the first per-port step to do, else the next coverage check."""
+    h = h or _find_host(st, st.get("target") or "")
+    if not h:
+        return None
+    cmds, legacy = _host_cmds(st, h["ip"]), _legacy_log(d)
+    cov = coverage(st, h, cmds)
+    todo_cov = [step for _, _, step, done, _ in cov if not done]
+    if not h["ports"] or (cov and not cov[0][3]):        # no ports yet, or no full TCP scan yet
+        return todo_cov[0] if todo_cov else None
+    for _, _, steps in _host_steps(h):
+        for s in steps:
+            if not s.startswith("check") and not _step_done(st, h["ip"], s, legacy, cmds):
+                return s
+    return todo_cov[0] if todo_cov else None
+
+def _legacy_log(d):
+    """Projects from before 1.2: steps named in the old logbook or notes count as done."""
+    return (_read(d / "logbook.md") + _read(d / "notes" / "notes.md")).lower() \
+        if (d / "notes" / "notes.md").exists() else ""
+
+def next_plan(d, st, h):
+    """'next' for scripts and AI assistants: the coverage checks and the per-port
+    playbook for one host, each step done (with the commands that did it) or still
+    to do, plus what runs on it right now. No credentials."""
+    legacy, cmds = _legacy_log(d), _host_cmds(st, h["ip"])
+    steps, untouched, manual = [], [], []
+    for cid, title, step, done, ids in coverage(st, h, cmds):
+        steps.append({"source": "coverage", "id": cid, "title": title, "step": step, "done": done, "by": ids})
+    for port, svc, ss in _host_steps(h):
+        if not ss:
+            manual.append(f"{port}/{svc}")
+            continue
+        todo = 0
+        for s in ss:
+            hits = _step_hits(st, h["ip"], s, cmds)
+            done = bool(hits) or _step_done(st, h["ip"], s, legacy, cmds)
+            todo += not done
+            steps.append({"source": "playbook", "port": port, "service": svc, "step": s, "done": done,
+                          "by": [c["id"] for c in hits]})
+        if todo == len(ss):
+            untouched.append(f"{port}/{svc}")
+    keys = _host_keys(st, h["ip"])[1]
+    return {"project": d.name, "host": h["ip"], "name": h.get("name", ""), "os": h.get("os", ""),
+            "active_box": h["ip"] == st.get("target"),
+            "ports": [{"port": p["port"], "proto": p["proto"], "service": p["service"],
+                       "version": p.get("version", "")}
+                      for p in sorted(h["ports"], key=lambda p: (p["proto"], p["port"]))],
+            "steps": steps,
+            "todo": sum(1 for s in steps if not s["done"]), "done": sum(1 for s in steps if s["done"]),
+            "untouched": untouched, "manual": manual,
+            "running": [_running_json(st, r) for r in running_now(d) if _cmd_on_host(r, keys, h["ip"])],
+            "other_hosts": [x["ip"] for x in st["hosts"] if x is not h and x["ports"]
+                            and any(not dn for _, dn in enum_steps(st, x, legacy))]}
+
+@with_lock
 def cmd_next(args):
     d = require_engagement()
     st = load_state(d)
-    n = auto_ingest_scans(d, st, quiet=False)
-    target = st.get("target") or current_target()
+    as_json = getattr(args, "json", False)
+    n = auto_ingest_scans(d, st, quiet=as_json)
+    asked = getattr(args, "host", None)
+    target = asked or st.get("target") or current_target()
     h = _find_host(st, target) if target else None
+    if asked and not h:
+        die(f"Unknown host {asked} (see 'pentrail hosts')")
+    if as_json:
+        if not h and target:
+            h = host_entry(target)          # known only as the target: the scans to start with
+        print(json.dumps(next_plan(d, st, h) if h else
+                         {"project": d.name, "host": None, "steps": [],
+                          "hint": "no active box: pentrail target <host>"}, indent=2))
+        return
     if not h or not h["ports"]:
         scan = _latest_scan(d)
         warn(f"No open ports known for {target or 'the target'} yet. Run a scan, e.g.:")
@@ -4463,31 +5086,48 @@ def cmd_next(args):
         if scan:
             print(f"    {DIM}(read {rel(d, scan)}, no open ports for this host in it){N}")
         return
-    legacy = (_read(d / "logbook.md") + _read(d / "notes" / "notes.md")).lower() \
-        if (d / "notes" / "notes.md").exists() else ""
-    info(f"{h['ip']}: {len(h['ports'])} open port(s)" + (f", {n['ports']} new from 1-enum/scans/" if n["ports"] else ""))
+    legacy, cmds = _legacy_log(d), _host_cmds(st, h["ip"])
+    ports = sorted(h["ports"], key=lambda p: p["port"])           # the same order as _host_steps
+    plan = [(p, svc, [(s, _step_done(st, h["ip"], s, legacy, cmds)) for s in steps])
+            for p, (_, svc, steps) in zip(ports, _host_steps(h))]
+    cov = coverage(st, h, cmds)
+    total = sum(len(steps) for _, _, steps in plan)
+    done = sum(dn for _, _, steps in plan for _, dn in steps)
+    cdone = sum(1 for x in cov if x[3])
+    print(f"{C}{_u('◆', '*')}{N} {BOLD}{h['ip']}{N}" + (f" {DIM}{h['name']}{N}" if h.get("name") else "")
+          + (f" {DIM}{h['os']}{N}" if h.get("os") else "")
+          + f"  {len(h['ports'])} open port(s)" + (f", {n['ports']} new from 1-enum/scans/" if n["ports"] else "")
+          + f"   {bar(done + cdone, total + len(cov))} {done + cdone}/{total + len(cov)} done")
+    keys = _host_keys(st, h["ip"])[1]
+    for r in running_now(d):
+        if _cmd_on_host(r, keys, h["ip"]):
+            print(_running_line(st, r))
     print()
-    total = done = 0
     untouched = []
-    for port, svc, steps in _host_steps(h):
-        label = f"{G}{port:>5}{N}/{svc}"
+    for p, svc, steps in plan:
+        label = (f"  {G}{p['port']:>5}{N}/{p['proto']}  {BOLD}{svc}{N}"
+                 + (f"  {DIM}{p['version'][:60]}{N}" if p.get("version") else ""))
         if not steps:
-            print(f"{label}  {DIM}(no standard playbook - enumerate manually){N}")
+            print(f"{label}  {DIM}no standard playbook: enumerate it by hand{N}\n")
             continue
         print(label)
-        todo = 0
-        for s in steps:
-            total += 1
-            if _step_done(st, h["ip"], s, legacy):
-                done += 1
-                print(f"    {G}[x]{N} {DIM}{s}{N}")
-            else:
-                todo += 1
-                print(f"    {Y}[ ]{N} {s}")
-        if todo == len(steps):
-            untouched.append(f"{port}/{svc}")
+        for s, dn in steps:
+            print(f"      {G}{SYM['done']}{N} {DIM}{s}{N}" if dn else f"      {Y}{SYM['todo']}{N} {s}")
+        if not any(dn for _, dn in steps):
+            untouched.append(f"{p['port']}/{svc}")
         print()
-    print(f"{B}Progress:{N} {done}/{total} standard steps seen.  {DIM}(same list: 1-enum/enum.md){N}")
+    print(f"  {BOLD}Coverage{N}  {DIM}full TCP, versions, UDP and vhosts: what the per-port steps cannot see{N}")
+    for _, title, step, dn, ids in cov:
+        if dn:
+            print(f"      {G}{SYM['done']}{N} {DIM}{title}" + (f"  (#{', #'.join(map(str, ids[-3:]))})" if ids else "") + N)
+        else:
+            print(f"      {Y}{SYM['todo']}{N} {title}: {step}")
+    print()
+    print(f"{BOLD}Progress{N}  {done}/{total} per-port steps, coverage {cdone}/{len(cov)}"
+          f"  {DIM}(the per-port list is also in 1-enum/enum.md){N}")
+    nxt = _next_up(d, st, h)
+    if nxt:
+        print(f"{C}{SYM['next']} next up{N}  {nxt}")
     if done == 0:
         warn("Nothing done yet - start at the top of the list above.")
     elif untouched:
@@ -4508,6 +5148,1250 @@ def cmd_next(args):
                  "jot what you tried (pentrail note ...) so the checklist stays accurate.")
     save_state(d, st)
 
+# ----------------------------------------------------------------------------- trace: what ran, by whom
+# What every command did, for you and for an AI assistant working next to you:
+# 'seen' answers "was this already run against that host?", 'trace' lists what ran
+# per host, 'show' prints one command's recorded output. A command still running (a
+# shot in flight, the command in your capture right now) counts too, so neither of
+# you starts the same scan twice.
+RUNNING_FILE = ".pentrail-running.json"
+
+def _running_file(d):
+    try:
+        data = json.loads((Path(d) / RUNNING_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _running_mark(d, entry):
+    """Put this process's shot on the project's list of running commands, or take it
+    off (entry None). Entries of processes that are gone are dropped on the way."""
+    with locked(d):
+        data = {k: v for k, v in _running_file(d).items() if k.isdigit() and int(k) != os.getpid()
+                and isinstance(v, dict) and process_alive(int(k))}
+        if entry is not None:
+            data[str(os.getpid())] = entry
+        f = Path(d) / RUNNING_FILE
+        try:
+            if data:
+                _atomic_write(f, json.dumps(data, indent=1) + "\n")
+            else:
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+def _capture_running(d):
+    """The command running right now in your capture of this project: the last
+    command-start marker in its recording with no end marker after it."""
+    m = _read_marker()
+    if not m or not process_alive(m.get("pid")) or \
+            str(Path(m.get("eng", "")).resolve()) != str(Path(d).resolve()):
+        return None
+    try:
+        with open(m["file"], "rb") as fh:
+            fh.seek(int(m.get("parsed", 0)))
+            data = fh.read()
+    except (OSError, ValueError, KeyError):
+        return None
+    tag = b"\x1b_pentrail:B:"
+    b = data.rfind(tag)
+    close = data.find(b"\x1b\\", b) if b >= 0 else -1
+    if close < 0 or data.find(b"\x1b_pentrail:E:", b) >= 0:
+        return None
+    seg = _decode_begin(data[b + len(tag):close].decode("ascii", "replace"))
+    if not seg or not seg["typed"].strip() or re.match(r"\s*pentrail\b", seg["typed"]):
+        return None
+    cmd = expand_vars(seg["typed"], dict(project_env(d), **seg["values"])).strip()
+    return {"pid": m["pid"], "cmd": redact_text(cmd)[0], "via": m.get("by", ""), "source": "capture",
+            "label": m.get("label", ""), "since": datetime.fromtimestamp(seg["ts"]).strftime("%Y-%m-%d %H:%M:%S")}
+
+def running_now(d):
+    """What runs on this project right now: shots in flight (yours or an AI
+    assistant's) and the command in your capture, oldest first."""
+    out = [dict(r, pid=int(k)) for k, r in _running_file(d).items()
+           if k.isdigit() and isinstance(r, dict) and process_alive(int(k))]
+    cap = _capture_running(d)
+    if cap:
+        out.append(cap)
+    for r in out:
+        r["prog"] = prog_of(r.get("cmd", ""))
+        r["hosts"] = [t["host"] for t in hosts_in_command(r.get("cmd", "")) if not t["excluded"] and not t["header"]]
+    return sorted(out, key=lambda r: r.get("since", ""))
+
+# Password-like arguments per tool, on top of --password=... and friends
+_SECRET_OPTS = {
+    "-p": ("netexec", "nxc", "crackmapexec", "cme", "hydra", "medusa", "sshpass", "evil-winrm", "smbmap",
+           "rdesktop", "bloodhound-python", "certipy", "enum4linux", "kerbrute"),
+    "-H": ("netexec", "nxc", "crackmapexec", "cme", "evil-winrm", "smbmap"),
+    "-w": ("ldapsearch",),
+}
+_VAL = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
+
+def mask_secrets(text, st=None, prog=""):
+    """Text for JSON and for an AI assistant: your redacted secrets, the credentials
+    pentrail stored, and password-like arguments become [secret]."""
+    if not text:
+        return text or ""
+    text = redact_text(text)[0]
+    known = {s for s in (_secrets(st) if st else []) if len(s) >= 3}
+    if known:
+        text = SECRET_TOKEN.sub(lambda m: "[secret]" if m.group(0) in known else m.group(0), text)
+    text = re.sub(r"(?i)(--?(?:pass(?:word)?|passwd|pwd|hashes|nthash|lmhash|aes-?key|secret|token|api-?key)"
+                  r"(?:\s+|=))" + _VAL, r"\1[secret]", text)
+    text = re.sub(r"(?i)\b(\w*(?:pass(?:word)?|passwd|secret|token)\w*=)" + _VAL, r"\1[secret]", text)
+    text = re.sub(r"(://[^/\s:@]+:)[^/\s@]+(@)", r"\1[secret]\2", text)               # URL user:pass@
+    text = re.sub(r"(?<![\w/:])([\w.\-]+(?:/[\w.\-]+)?:)[^\s@/:]+(@[\w.\-\[])", r"\1[secret]\2", text)  # dom/user:pass@host
+    text = re.sub(r"(-U\s+['\"]?[^\s%'\"]*%)[^\s'\"]+", r"\1[secret]", text)           # smbclient -U user%pass
+    # the tool's own password options; with no program given (a note, a logbook line),
+    # those of every tool the text names: masking a bit too much beats a leak
+    progs = {prog.lower()} if prog else {w.lower() for w in re.findall(r"[A-Za-z][\w.+-]*", text)}
+    if "curl" in progs:                                                                  # -u user:pass, not a URL
+        text = re.sub(r"((?:-u|--user)\s+['\"]?[^\s:'\"/]+:)(?!//)[^\s'\"]+", r"\1[secret]", text)
+    if progs & {"xfreerdp", "xfreerdp3", "wlfreerdp"}:
+        text = re.sub(r"(/p:)\S+", r"\1[secret]", text)
+    for opt, tools in _SECRET_OPTS.items():
+        if progs & set(tools):
+            text = re.sub(r"(\s%s\s+)%s" % (re.escape(opt), _VAL), r"\1[secret]", text)
+    if progs & {"mysql", "mariadb"}:
+        text = re.sub(r"(\s-p)(?=\S)" + _VAL, r"\1[secret]", text)
+    return text
+
+def cmd_source(c):
+    """Where a recorded command comes from: 'capture' (a recording), 'shot', or
+    'ingest' (a saved tool file)."""
+    f = "/" + (c.get("file") or "").replace("\\", "/")
+    if "/scans/" in f:
+        return "ingest"
+    if f.endswith(".log"):
+        return "capture"
+    if "/evidence/" in f and f.endswith((".txt", ".png")):
+        return "shot"
+    return "ingest"
+
+def _who(c):
+    return c.get("via") or "you"
+
+def _cmd_json(st, c):
+    return {"id": c["id"], "ts": c["ts"], "phase": c.get("phase", ""), "by": _who(c), "source": cmd_source(c),
+            "rc": c.get("rc"), "dur": c.get("dur"), "prog": c.get("prog", ""),
+            "cmd": mask_secrets(c.get("cmd") or "", st, c.get("prog")), "file": c.get("file", ""),
+            "shot": c.get("shot"), "hosts": c.get("hosts", [])}
+
+def _running_json(st, r):
+    return {"running": True, "since": r.get("since", ""), "by": _who(r), "source": r.get("source", ""),
+            "label": r.get("label", ""), "prog": r.get("prog", ""),
+            "cmd": mask_secrets(r.get("cmd", ""), st, r.get("prog")), "hosts": r.get("hosts", [])}
+
+def _trace_line(st, c):
+    rc = "" if c.get("rc") is None else f"rc {c['rc']}"
+    return (f"  {C}#{c['id']:<4}{N}{c['ts'][5:16]}  {c.get('phase', ''):<8} {_who(c):<6} {cmd_source(c):<8}"
+            f"{rc:<7}{mask_secrets(c.get('cmd') or '', st, c.get('prog'))}  {DIM}{c.get('file', '')}{N}"
+            + (f" {M}{SYM['shot']}{N}" if c.get("shot") else ""))
+
+def _running_line(st, r):
+    what = r.get("source", "") + (f" {r['label']}" if r.get("label") else "")
+    return (f"  {Y}running{N}  since {r.get('since', '')[11:16]}  {_who(r):<6} {what:<16} "
+            f"{mask_secrets(r.get('cmd', ''), st, r.get('prog'))}")
+
+def _seen_hits(st, h, ip, q, cmds):
+    """(how, hits, note) for 'seen': q as a coverage check (full-tcp, versions, udp,
+    vhosts), a tool, an nmap NSE script, or text in the command line."""
+    if q.lower() in COVERAGE:
+        for cid, _, step, done, ids in coverage(st, h or host_entry(ip), cmds):
+            if cid == q.lower():
+                return "coverage", ([c for c in cmds if c["id"] in ids] if done else []), \
+                    ("" if done else f"still to do: {step}")
+        return "coverage", [], "(only for a host with a web port)"
+    how, hits = match_commands(cmds, q)
+    return how, hits, ""
+
+def _nse_scripts(cmd):
+    """The NSE scripts (or categories) an nmap command line runs; -sC and -A run 'default'."""
+    out = []
+    for m in re.finditer(r"--script(?:=|\s+)(\S+)", cmd):
+        out += [x.strip("'\"") for x in m.group(1).split(",") if x.strip("'\"")]
+    if any(w == "-A" or re.fullmatch(r"-s[A-Za-z]*C[A-Za-z]*", w) for w in _words(cmd)):
+        out.append("default")
+    return out
+
+def match_commands(cmds, q):
+    """('tool' | 'nse' | 'text', matching commands): q as a tool (the dirbusters count
+    as one), else as an nmap NSE script, else as text in the command line, not inside
+    a longer word ('sh' is not in /usr/share, 'raft-medium' is in raft-medium-dirs)."""
+    ql = q.lower()
+    group = _tool_group(ql)
+    hits = [c for c in cmds if (c.get("prog") or "").lower() in group]
+    if hits:
+        return "tool", hits
+    hits = [c for c in cmds if c.get("prog") == "nmap" and any(
+        fnmatch.fnmatch(ql, s.lower()) or fnmatch.fnmatch(s.lower(), ql) for s in _nse_scripts(c.get("cmd") or ""))]
+    if hits:
+        return "nse", hits
+    pat = re.compile(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(ql), re.I)
+    return "text", [c for c in cmds if pat.search(c.get("cmd") or "")]
+
+def cmd_seen(args):
+    """Was this already run against a host? Exit 0 with the commands (or the one
+    running now), 1 if not."""
+    what = [w for w in (args.what or []) if w != "--"]
+    if not what:
+        die("Usage: pentrail seen <host> <tool|nse-script|text>")
+    d = require_engagement()
+    st = load_state(d)
+    q = " ".join(what)
+    h, keys = _host_keys(st, args.host)
+    ip = h["ip"] if h else args.host
+    cmds = _host_cmds(st, args.host)
+    how, hits, note = _seen_hits(st, h, ip, q, cmds)
+    test = COVERAGE_TEST.get(q.lower())
+    running = [r for r in running_now(d) if _cmd_on_host(r, keys, ip)
+               and (test(r) if test else match_commands([r], q)[1])]
+    label = f"{q} on {ip}"
+    if not hits and not running:
+        info(f"{label}: not run yet." + (f"  {note}" if note else ""))
+        sys.exit(1)
+    if not hits and not test:
+        how = match_commands(running, q)[0]          # only running: say how it matched that
+    group = _tool_group(q)
+    kind = {"tool": "", "nse": " (nmap script)", "text": " (in the command line)",
+            "coverage": " (coverage check)"}[how]
+    said = [f"run {len(hits)}x"] if hits else []
+    ok(f"{label}{kind}: " + ", ".join(said + (["running now"] if running else []))
+       + (f"  {DIM}({', '.join(sorted(group))} count as one){N}" if how == "tool" and len(group) > 1 else ""))
+    for c in sorted(hits, key=lambda c: (c["ts"], c["id"])):
+        print(_trace_line(st, c))
+    for r in running:
+        print(_running_line(st, r))
+    if hits:
+        print(f"    {DIM}read the output: pentrail show <id>{N}")
+
+def _found_on(st, h):
+    """Ids of the commands whose results landed on a host (ports, web paths, names, leads)."""
+    keys = _keys(h)
+    ids = {p.get("by") for p in h["ports"]}
+    ids |= {w.get("by") for w in st["web"] if w["host"] in keys}
+    ids |= {n.get("by") for n in st["names"] if n.get("ip") == h["ip"] or n["name"] in keys}
+    ids |= {v.get("by") for v in st["vectors"] if v.get("host") in keys}
+    return ids - {None}
+
+def trace_groups(st, host=None, tool=None):
+    """[(host, name, [commands])]: what ran against each host (or one), oldest first.
+    Commands tied to no tracked host come last, under ''."""
+    hosts = ([_find_host(st, host) or host_entry(host)] if host else st["hosts"])
+    out, listed = [], set()
+    for h in hosts:
+        found, keys = _found_on(st, h), _host_keys(st, h["ip"])[1]
+        cs = [c for c in st["commands"] if c["id"] in found or _cmd_on_host(c, keys, h["ip"])]
+        if tool:
+            cs = match_commands(cs, tool)[1]
+        listed |= {c["id"] for c in cs}
+        out.append((h["ip"], h.get("name", ""), sorted(cs, key=lambda c: (c["ts"], c["id"]))))
+    if not host:
+        rest = [c for c in st["commands"] if c["id"] not in listed]
+        rest = match_commands(rest, tool)[1] if tool else rest
+        if rest:
+            out.append(("", "", sorted(rest, key=lambda c: (c["ts"], c["id"]))))
+    return out
+
+def cmd_trace(args):
+    """What ran against each host: when, in which phase, by whom, from where, where
+    its output is; plus what is running right now."""
+    d = require_engagement()
+    st = load_state(d)
+    groups = trace_groups(st, args.host, args.tool)
+    running = running_now(d)
+    if args.host:
+        h, keys = _host_keys(st, args.host)
+        running = [r for r in running if _cmd_on_host(r, keys, h["ip"] if h else args.host)]
+    if args.tool:
+        running = [r for r in running if match_commands([r], args.tool)[1]]
+    if args.json:
+        print(json.dumps({"project": d.name, "host": args.host, "tool": args.tool,
+                          "hosts": [{"host": ip, "name": name, "commands": [_cmd_json(st, c) for c in cs]}
+                                    for ip, name, cs in groups if cs or args.host],
+                          "running": [_running_json(st, r) for r in running]}, indent=2))
+        return
+    shown = 0
+    for ip, name, cs in groups:
+        if not cs:
+            continue
+        print(f"{B}{ip or '(not tied to a tracked host)'}{N}" + (f" {name}" if name else "")
+              + f"  {DIM}{len(cs)} command(s){N}")
+        for c in cs:
+            print(_trace_line(st, c))
+        print()
+        shown += len(cs)
+    if running:
+        print(f"{B}Running now{N}")
+        for r in running:
+            print(_running_line(st, r))
+        print()
+    if not shown and not running:
+        info("Nothing recorded yet" + (f" for {args.host}" if args.host else "")
+             + (f" with {args.tool}" if args.tool else "") + ".")
+        return
+    print(f"{DIM}  #id  time  phase  who  source  exit  command  file      output: pentrail show <id>{N}")
+
+def _find_in_recording(d, st, c, lines):
+    """For commands recorded before 1.4 (no line numbers): the k-th line that shows
+    the command, up to the next prompt."""
+    clean = [clean_terminal(strip_markers(l)) for l in lines]
+    cmd = c.get("cmd") or ""
+    needles = [cmd] + [cmd.replace(v, "$" + k) for k, v in project_env(d).items() if v and v in cmd]
+    k = sum(1 for x in st["commands"] if x.get("file") == c.get("file") and x.get("cmd") == cmd and x["id"] < c["id"])
+    for nd in needles:
+        hits = [i for i, l in enumerate(clean) if nd and nd in l]
+        if hits:
+            i = hits[min(k, len(hits) - 1)]
+            j = next((x for x in range(i + 1, len(clean))
+                      if _PROMPT.match(clean[x]) or clean[x].startswith("┌──")), len(clean))
+            return lines[i:j]
+    return None
+
+def show_lines(d, st, c):
+    """(file, lines): a recorded command's output as it is in its file, starting at its
+    command line. lines is None when the command cannot be found in a recording."""
+    f = d / c["file"] if c.get("file") else None
+    if f and f.suffix == ".png" and f.with_suffix(".txt").is_file():
+        f = f.with_suffix(".txt")                       # the text kept next to the screenshot
+    if f and f.suffix == ".xml" and f.with_suffix(".nmap").is_file():
+        f = f.with_suffix(".nmap")                      # nmap -oA: the normal output reads better
+    if not f or not f.is_file():
+        return f, None
+    raw = f.read_bytes().decode("utf-8", "replace")
+    if f.suffix == ".xml" and "<nmaprun" in raw:
+        raw = _nmap_xml_as_text(raw)
+    lines = raw.split("\n")                             # not splitlines(): recordings keep their \r
+    if cmd_source(c) == "capture":
+        if c.get("lines"):
+            a, b = c["lines"]
+            return f, lines[a:b + 1]
+        return f, _find_in_recording(d, st, c, lines)
+    cmd = c.get("cmd") or ""
+    first = clean_terminal(strip_markers(lines[0])).strip() if lines else ""
+    if cmd and not cmd.startswith("(file)") and not first.startswith(("$ ", "# Nmap")):
+        lines = [f"$ {cmd}"] + lines                    # a tool's own output file: say what made it
+    return f, lines
+
+def cmd_show(args):
+    """The recorded output of one command, ANSI stripped, from its command line on."""
+    d = require_engagement()
+    st = load_state(d)
+    try:
+        cid = int(str(args.id).lstrip("#"))
+    except ValueError:
+        die("Usage: pentrail show <command id> [-n lines]   (ids: pentrail trace)")
+    c = next((c for c in st["commands"] if c["id"] == cid), None)
+    if not c:
+        die(f"No command #{cid} (see 'pentrail trace')")
+    f, lines = show_lines(d, st, c)
+    if lines is None and (not f or not f.is_file()):
+        die(f"No output for #{cid}: its file ({c.get('file') or 'none'}) is not on disk")
+    if lines is None:
+        die(f"Could not find #{cid} in {rel(d, f)} (recorded before pentrail 1.4); open the file itself")
+    out = redact_text(clean_terminal(strip_markers("\n".join(lines))))[0].rstrip("\n").split("\n")
+    n = 200 if args.n is None else args.n
+    print("\n".join(out[:n] if n > 0 else out))
+    if 0 < n < len(out):
+        print(f"{DIM}... {len(out) - n} more line(s): pentrail show {cid} -n 0{N}")
+
+def host_json(st, h):
+    """One host for 'hosts --json': ports, names, web paths, leads and notes; free
+    text masked (no credentials)."""
+    keys = _keys(h)
+    return {"ip": h["ip"], "name": h.get("name", ""), "os": h.get("os", ""), "owned": h["owned"],
+            "active_box": h["ip"] == st.get("target"),
+            "names": sorted(set(h.get("aliases", [])) | {n["name"] for n in st["names"] if n.get("ip") == h["ip"]}),
+            "ports": [{"port": p["port"], "proto": p["proto"], "service": p["service"],
+                       "version": p.get("version", ""), "by": p.get("by")}
+                      for p in sorted(h["ports"], key=lambda p: (p["proto"], p["port"]))],
+            "web": [{"url": mask_secrets(w["url"], st), "status": w.get("status"),
+                     "note": mask_secrets(w.get("note", ""), st), "by": w.get("by")}
+                    for w in st["web"] if w["host"] in keys],
+            "leads": [{"id": v["id"], "type": v.get("type", "misc"), "status": v["status"],
+                       "desc": mask_secrets(v["desc"], st), "finding": v.get("finding"), "by": v.get("by")}
+                      for v in st["vectors"] if v.get("host") in keys],
+            "notes": [{"id": n["id"], "phase": n.get("phase", ""), "ts": n["ts"], "text": mask_secrets(n["text"], st)}
+                      for n in st["notes"] if n.get("host") == h["ip"]]}
+
+# ----------------------------------------------------------------------------- AI layer (Claude Code)
+# PeTe, pentrail's AI layer (ai/claude/ in the repo), runs in Claude Code. Claude Code
+# calls 'pentrail ai hook sessionstart' when a session starts (the brief below becomes
+# PeTe's context) and 'pentrail ai hook pretooluse' before every Bash or WebFetch call
+# PeTe makes (the guardrail). Without the AI layer none of this runs: pentrail works the
+# same on its own.
+
+def _project_at(path):
+    """The pentrail project folder that holds 'path' (or is it), if any."""
+    try:
+        p = Path(path).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    for q in (p, *p.parents):
+        if (q / "state.json").is_file() and (q / SCOPE_DOC).is_file():
+            return q
+    return None
+
+def ai_project(cwd=None, fallback=True):
+    """The project an AI session works in: $PENTRAIL_PROJECT, else the project that holds
+    the session's folder ($CLAUDE_PROJECT_DIR, the hook's cwd), else (for you at a
+    terminal, not for the hook) the active project."""
+    if os.environ.get("PENTRAIL_PROJECT"):
+        return current_dir()
+    for p in (os.environ.get("CLAUDE_PROJECT_DIR"), cwd or os.getcwd()):
+        d = _project_at(p) if p else None
+        if d:
+            return d
+    return current_dir() if fallback else None
+
+RULE_DEFAULTS = dict(re.findall(r"^- (\w+): (\S+)", RULES_BLOCK, re.M))
+
+def pete_rules(d):
+    """{rule: value} from the PeTe rules in scope.md; None when the block is not there."""
+    m = RULES_RE.search(_read(d / SCOPE_DOC))
+    return dict(re.findall(r"^- (\w+):\s*(\S+)", m.group(0), re.M)) if m else None
+
+def _brief_log(line, st):
+    """A logbook line for the brief: shorter, and never a credential or a flag value."""
+    m = re.match(r"- \d{4}-(\d\d-\d\d \d\d:\d\d):\d\d\s+`(\w+)\s*` (.*)$", line)
+    if not m:
+        return mask_secrets(line, st)
+    when, kind, text = m.groups()
+    if kind in ("cred", "creds"):
+        text = "a credential was recorded (pentrail creds)"
+    elif kind == "flag":
+        text = re.sub(r":.*", ": [hidden]", text)
+    return f"- {when} {kind}: {mask_secrets(text, st)}"
+
+def ai_brief(d, st):
+    """The session brief: what PeTe needs to start, as short factual Markdown (under 60
+    lines). Project, scope, rules, hosts with the plan, what runs, open leads, findings,
+    and the last logbook lines. Never credentials."""
+    sc = Scope(d, st)
+    L = [f"# pentrail session brief: {d.name}", "",
+         f"- Project folder: {d} (pentrail {VERSION}). Phase: {st.get('phase') or 'enum'}. "
+         f"Active box: {st.get('target') or 'none'}."]
+    if sc.defined:
+        L.append(f"- Scope: {sc.summary(6)}. Guard: {guard_mode()}. "
+                 f"Conflicts: {len(scope_conflicts(sc)[0]) or 'none'}.")
+    else:
+        L.append("- Scope: not set. pentrail blocks nothing until the tester sets it (pentrail scope add).")
+    rules = pete_rules(d)
+    if rules:
+        by = {}
+        for k, v in rules.items():
+            by.setdefault(v if v in ("allow", "ask", "deny") else "other", []).append(k)
+        L.append("- PeTe rules: " + "; ".join(f"{v} {', '.join(by[v])}" for v in ("allow", "ask", "deny") if v in by)
+                 + "".join(f"; {k} {rules[k]}" for k in by.get("other", [])) + ".")
+    else:
+        L.append("- PeTe rules: not in scope.md; the defaults apply (brute force, password spraying, "
+                 "exploitation and denial of service deny; vulnerability scripts, credentialed "
+                 "enumeration and sudo ask).")
+    roe = re.search(r"^## Rules of engagement\n(.*?)(?=^## |\Z)", RULES_RE.sub("", _read(d / SCOPE_DOC)) + "\n",
+                    re.S | re.M)
+    filled = []
+    for l in (roe.group(1).splitlines() if roe else []):
+        m = re.match(r"-\s*([^:]+):[ \t]*(\S.*)$", l)
+        if m:
+            key, val = m.group(1).strip(), m.group(2).strip()
+            if re.search(r"account|credential|password|secret|token", key, re.I):
+                val = "(see 0-scope/scope.md)"
+            filled.append(f"{key}: {mask_secrets(val, st)}")
+    if filled:
+        L.append("- Rules of engagement: " + "; ".join(filled) + ".")
+    L.append(f"- Auto-shot: {CFG.get('auto_shot', 'off')}.")
+    L += ["", f"## Hosts ({len(st['hosts'])})"]
+    for h in st["hosts"][:8]:
+        cmds = _host_cmds(st, h["ip"])
+        steps = enum_steps(st, h)
+        ctodo = [cid for cid, _, _, done, _ in coverage(st, h, cmds) if not done]
+        L.append(f"- {h['ip']}" + (f" ({h['name']})" if h.get("name") else "") + (f", {h['os']}" if h.get("os") else "")
+                 + (", owned" if h["owned"] else "") + f": {_ports_short(h, 10) or 'no open ports known'}. "
+                 f"Plan: {sum(1 for _, dn in steps if not dn)} of {len(steps)} per-port steps to do; "
+                 f"coverage to do: {', '.join(ctodo) or 'none'}.")
+    if len(st["hosts"]) > 8:
+        L.append(f"- {len(st['hosts']) - 8} more: pentrail hosts --json")
+    if not st["hosts"]:
+        L.append("- none yet")
+    running = running_now(d)
+    if running:
+        L += ["", "## Running now"] + [
+            f"- {mask_secrets(r.get('cmd', ''), st, r.get('prog'))} ({_who(r)}, {r.get('source', '')}"
+            + (f" {r['label']}" if r.get("label") else "") + f", since {r.get('since', '')[11:16]})"
+            for r in running[:4]]
+    openv = sorted((v for v in st["vectors"] if v["status"] in ("open", "working")),
+                   key=lambda v: (STATUS_ORDER.get(v["status"], 1), v["id"]))
+    L += ["", f"## Open leads ({len(openv)})"] + [
+        f"- #{v['id']} [{v.get('type', 'misc')}] {mask_secrets(v['desc'], st)} ({v['status']}"
+        + (f", {v['host']}" if v.get("host") else "") + ")" for v in openv[:8]]
+    if len(openv) > 8:
+        L.append(f"- {len(openv) - 8} more: pentrail vectors")
+    if not openv:
+        L.append("- none")
+    fs = list_findings(d)
+    L += ["", f"## Findings ({len(fs)})"] + ([f"- {x['id']} {x['sev']}: {mask_secrets(x['title'], st)}"
+                                              for x in fs[:6]] or ["- none"])
+    log = [l for l in _read(d / "logbook.md").splitlines() if l.startswith("- ")][-10:]
+    L += ["", "## Last logbook lines"] + ([_brief_log(l, st) for l in log] or ["- none"])
+    L += ["", "Plan per host: pentrail next <host> --json. What ran: pentrail trace -H <host>. "
+              "Output of a command: pentrail show <id>."]
+    return "\n".join(L)
+
+# --- the guardrail hook ----------------------------------------------------------------
+_OVERRIDE = re.compile(r"(?<![\w-])scope-ok(?![\w-])|PENTRAIL_SCOPE_OK")
+_PROTECTED = re.compile(r"0-scope/|(?<![\w.-])(?:logbook\.md|state\.json|CLAUDE\.md)(?![\w.-])|\.claude/")
+_READERS = frozenset("cat less more head tail grep egrep fgrep rg wc diff cmp jq file stat ls tree cd".split())
+# pentrail commands that change PeTe's own guardrails (the scope, the guard, the PeTe
+# rules, PeTe itself) or hand it your shell: the tester's, whatever the settings say.
+_GUARD_CMDS = re.compile(r"(?:scope\s+(?:add|in|out|exclude|guard)|config\s+(?:scope_guard|scope_allow|pete_rules)"
+                         r"|ai\s+(?:install|update|remove)|capture|redact|setup|update|upgrade|uninstall)(?:\s|$)")
+
+def split_cmdline(cmd):
+    """A command line split into its commands at |, ||, &&, ; and & (and newlines), but
+    not inside quotes, and not at redirects such as 2>&1 or &>file."""
+    parts, cur, q, i = [], [], None, 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if q:
+            cur.append(ch)
+            if ch == q:
+                q = None
+            elif ch == "\\" and q == '"' and i + 1 < len(cmd):
+                cur.append(cmd[i + 1]); i += 1
+        elif ch in "'\"":
+            q = ch; cur.append(ch)
+        elif ch == "\\" and i + 1 < len(cmd):
+            cur += [ch, cmd[i + 1]]; i += 1
+        elif ch in "|;&\n" and not (ch == "&" and ((i and cmd[i - 1] in "<>") or cmd[i + 1:i + 2] == ">")):
+            parts.append("".join(cur)); cur = []
+            if ch in "|&" and cmd[i + 1:i + 2] == ch:
+                i += 1                                   # || and &&
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return [x.strip() for x in parts if x.strip()]
+
+# Tools the PeTe rules name, so the hook can hold PeTe to them: a 'deny' rule blocks the
+# command (in a 'pentrail shot' too), 'ask' puts it to you, 'allow' lets it through.
+RULE_TOOLS = {
+    "brute_force": {"hydra", "medusa", "ncrack", "patator", "crowbar", "legba"},
+    "password_spraying": {"kerbrute", "sprayhound"},
+    "exploitation": {"msfconsole", "msfvenom", "sqlmap", "commix", "responder", "mitm6", "bettercap",
+                     "evil-winrm", "xfreerdp", "xfreerdp3", "rdesktop", "pth-winexe"}
+                    | {p + n for p in ("", "impacket-") for n in (
+                        "ntlmrelayx", "secretsdump", "psexec", "wmiexec", "smbexec", "atexec", "dcomexec",
+                        "getuserspns", "getnpusers")},
+    "dos": {"slowloris", "slowhttptest", "thc-ssl-dos", "t50", "goldeneye"},
+    "vuln_scripts": {"nikto", "nuclei", "wpscan", "joomscan", "droopescan"},
+}
+
+def rule_of(cmd):
+    """The PeTe rule a command falls under, for the tools it can be told by (brute force,
+    spraying, exploitation, denial of service, vulnerability scripts, credentials, root),
+    or None: then only the scope decides."""
+    words, prog = _words(cmd), prog_of(cmd)
+    for rule, tools in RULE_TOOLS.items():
+        if prog in tools:
+            return "brute_force" if prog == "wpscan" and ("-P" in words or "--passwords" in words) else rule
+    if prog == "nmap":
+        scripts = [s.lower() for s in _nse_scripts(cmd)]
+        if any("brute" in s for s in scripts):
+            return "brute_force"
+        if "exploit" in scripts or "dos" in scripts:
+            return "exploitation" if "exploit" in scripts else "dos"
+        if "unsafe=1" in cmd or any("vuln" in s or s == "intrusive" for s in scripts):
+            return "vuln_scripts"
+    if prog in ("hping3", "hping") and any(w.startswith("--flood") for w in words):
+        return "dos"
+    opts = {w: words[i + 1] for i, w in enumerate(words[:-1]) if w.startswith("-")}
+    if prog in _tool_group("netexec"):
+        if any(v.endswith((".txt", ".lst")) or "/" in v for k, v in opts.items() if k in ("-u", "-p")):
+            return "password_spraying"
+        if any(v.strip("'\"") for k, v in opts.items() if k in ("-p", "-H")):
+            return "credentialed_enum"
+    if prog in ("smbclient", "rpcclient") and "%" in opts.get("-U", "").rstrip("%"):
+        return "credentialed_enum"
+    if prog == "ldapsearch" and ("-w" in opts or "-W" in words):
+        return "credentialed_enum"
+    if words and os.path.basename(words[0]) in ("sudo", "doas"):
+        return "root_commands"
+    return None
+
+def _shot_inner(words):
+    """The command a 'pentrail shot ...' line runs, after shot's own options ([] for
+    shot --last); None when the line is not a shot."""
+    if len(words) < 2 or os.path.basename(words[0]) != "pentrail" or words[1] != "shot":
+        return None
+    i = 2
+    while i < len(words):
+        w = words[i]
+        if w == "--":
+            return words[i + 1:]
+        if w in ("-l", "--label", "--by"):
+            i += 2
+        elif w.startswith("--last"):
+            return []
+        elif w.startswith("-"):
+            i += 1
+        else:
+            return words[i:]
+    return []
+
+def _clip(s, n=90):
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+def _pretool(decision, reason, note):
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                   "permissionDecisionReason": reason},
+            **({"systemMessage": note} if note else {})}
+
+def ai_pretooluse(data):
+    """The guardrail before every Bash or WebFetch call PeTe makes. Denies a command aimed
+    at a host outside the scope, a command aimed at an in-scope host that does not go
+    through 'pentrail shot' (so it is checked and recorded), scope overrides, edits of the
+    scope, logbook and PeTe's own files, and tools the PeTe rules deny; asks you about
+    tools they mark 'ask'. Everything else (pentrail itself, local work, tooling hosts)
+    gets no decision from here: Claude Code's permission rules decide."""
+    tool, tin = data.get("tool_name"), data.get("tool_input") or {}
+    if tool not in ("Bash", "WebFetch") or not isinstance(tin, dict):
+        return None
+    d = ai_project(data.get("cwd"), fallback=False)
+    if not d:
+        return {"systemMessage": f"{SYM['warn']} pentrail guard: no pentrail project in this folder, "
+                                 "so commands are not scope-checked."}
+    st = load_state(d)
+    scope = Scope(d, st)
+    cwd = data.get("cwd") or os.getcwd()
+    if tool == "WebFetch":
+        url = str(tin.get("url") or "")
+        host = _url_host(url)[0]
+        if not host:
+            return None
+        if scope.verdict(host) == "unknown" and _ip_obj(host) is None:
+            scope.lookup([host])
+            _save_lookups(d, st, scope)
+        v = scope.verdict(host)
+        if v in ("in", "conflict"):
+            why = (f"{url} is a target ({VERDICT_TEXT[v]}). PeTe reaches targets only through pentrail, so the "
+                   f"request is scope-checked and recorded. Run it as: pentrail shot -q --by pete -l web -- "
+                   f"curl -sk '{url}'")
+        elif v == "out":
+            why = f"{host} is out of scope ({scope.entry_for(host)}). Leave it alone."
+        else:
+            return None
+        log_event("scope", f"hook blocked: fetch {url}  [{VERDICT_TEXT[v]}]", d)
+        return _pretool("deny", why, f"{SYM['err']} pentrail guard stopped a fetch of {_clip(url, 60)}: {VERDICT_TEXT[v]}")
+    cmd = str(tin.get("command") or "")
+    if not cmd.strip():
+        return None
+    if _OVERRIDE.search(cmd):
+        log_event("scope", f"hook blocked: {cmd}  [scope override]", d)
+        return _pretool("deny", "Scope overrides (scope-ok, PENTRAIL_SCOPE_OK) are for the tester, never for PeTe. "
+                                "Leave the host alone and tell the tester why you wanted it.",
+                        f"{SYM['err']} pentrail guard stopped a scope override: {_clip(cmd, 60)}")
+    env = project_env(d)
+    env.update(os.environ)
+    rules = pete_rules(d)
+    deny, ask, sends = [], [], []
+    for part in split_cmdline(expand_vars(cmd, env)):
+        words, prog = _words(part), prog_of(part)
+        inner = _shot_inner(words)
+        if prog == "pentrail" and inner is None:
+            i = next((k for k, w in enumerate(words) if os.path.basename(w) == "pentrail"), len(words))
+            if _GUARD_CMDS.match(" ".join(words[i + 1:])):
+                deny.append(("changes PeTe's guardrails", f"`{_clip(part)}` changes the scope, the scope guard, "
+                             "the PeTe rules or PeTe itself, or opens your shell: that is the tester's to run."))
+            continue                                   # pentrail's own commands guard themselves
+        if inner is None and _PROTECTED.search(part) and (prog not in _READERS or ">" in part):
+            deny.append(("edits the tester's files", f"`{_clip(part)}` would change a file that is the tester's: "
+                         "PeTe does not edit 0-scope/, the logbook, state.json, CLAUDE.md or .claude/."))
+            continue
+        target = " ".join(shlex.quote(w) for w in inner) if inner is not None else part
+        rule = rule_of(target) if target else None
+        if rule:
+            val = (rules or RULE_DEFAULTS).get(rule, "ask")
+            if val == "deny":
+                deny.append((f"PeTe rule {rule}: deny", f"`{_clip(target)}` falls under {rule}, which the PeTe "
+                             "rules deny (0-scope/scope.md). It is the tester's to run, if at all."))
+            elif val != "allow":
+                ask.append(f"PeTe rule {rule}: {val}. PeTe wants to run: {_clip(target, 120)}")
+        if inner is None:
+            sends.append(part)                         # 'pentrail shot' checks its own scope
+    bad, inside = [], []
+    for part in sends:
+        res, _ = guard_verdicts(scope, part, cwd)
+        bad += [(t, v, why) for t, v, why in res if v in ("out", "unknown", "conflict", "none")]
+        if any(v == "in" for _, v, _ in res):
+            inside.append((part, [t for t, v, _ in res if v == "in"]))
+    if sends:
+        _save_lookups(d, st, scope)
+        if bad:
+            deny.append((f"not in scope: {', '.join(t for t, _, _ in bad)}",
+                         "Not in scope: " + ", ".join(f"{t} ({VERDICT_TEXT[v]}{': ' + why if why else ''})"
+                                                      for t, v, why in bad)
+                         + (". No scope is set yet: the tester adds it with pentrail scope add."
+                            if any(v == "none" for _, v, _ in bad) else
+                            ". Leave it alone; if it should be in scope, tell the tester (they edit the scope).")))
+        elif inside:
+            first = inside[0][0]
+            label = re.sub(r"[^A-Za-z0-9._-]", "-", prog_of(first) or "cmd")[:16] or "cmd"
+            one = re.sub(r"\s+(?:\d?>>?|<)\s*\S+", "", first)       # shot keeps the output itself
+            hosts = ", ".join(sorted({t for _, ts in inside for t in ts}))
+            deny.append((f"{hosts} in scope, not through pentrail shot",
+                         f"This command reaches {hosts} (in scope) outside pentrail, so it would not be checked or "
+                         f"recorded. Run it as: pentrail shot -q --by pete -l {label} -- {one}"
+                         + (" (pentrail shot runs one program without a shell: drop pipes and redirects, and write "
+                            "the tool's output to 1-enum/scans/ so pentrail reads it)"
+                            if len(sends) > 1 or one != first or re.search(r"[|<>]", cmd) else "")))
+    if deny:
+        log_event("scope", f"hook blocked: {cmd}  [{'; '.join(x for x, _ in deny)}]", d)
+        return _pretool("deny", " ".join(x for _, x in deny),
+                        f"{SYM['err']} pentrail guard stopped: {_clip(cmd, 70)} ({deny[0][0]})")
+    if ask:
+        return _pretool("ask", " ".join(ask), "")
+    return None
+
+def ai_sessionstart(data):
+    """Session start: the brief goes into PeTe's context, you get a one-line greeting,
+    and a new session is named after the project."""
+    d = ai_project(data.get("cwd"), fallback=False)
+    if not d:
+        return {"systemMessage": f"{SYM['warn']} pentrail: no pentrail project in this folder, "
+                                 "so PeTe starts without a session brief."}
+    st = load_state(d)
+    openv = sum(1 for v in st["vectors"] if v["status"] in ("open", "working"))
+    out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ai_brief(d, st)},
+           "systemMessage": f"PeTe {_u('◕‿◕', '(o_o)')} ready {SYM['dot']} {d.name} {SYM['dot']} active box "
+                            f"{st.get('target') or '-'} {SYM['dot']} {len(st['hosts'])} host(s), {openv} open lead(s) "
+                            f"{SYM['dot']} scope guard and PeTe rules on"}
+    if data.get("source") in ("startup", "fork") and not data.get("session_title"):
+        out["hookSpecificOutput"]["sessionTitle"] = f"PeTe {SYM['dot']} {d.name}"
+    return out
+
+def ai_statusline(data):
+    """The line under Claude Code's prompt while PeTe works: the project, the active box,
+    the phase, open leads, what runs now and the scope guard. It only reads."""
+    ws = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+    d = ai_project(ws.get("current_dir") or data.get("cwd"), fallback=False)
+    col = (lambda code: "") if os.environ.get("NO_COLOR") else (lambda code: code)   # Claude Code shows colours
+    m, b, dim, n = col("\033[35m"), col("\033[1m"), col("\033[2m"), col("\033[0m")
+    dot = f" {dim}{SYM['dot']}{n} "
+    if not d:
+        return f"{m}PeTe{n}{dot}{dim}no pentrail project here{n}"
+    st = load_state(d)
+    openv = sum(1 for v in st["vectors"] if v["status"] in ("open", "working"))
+    gm = guard_mode()
+    parts = [f"{m}PeTe {_u('◕‿◕', '(o_o)')}{n}", f"{b}{d.name}{n}", f"box {st.get('target') or '-'}",
+             st.get("phase") or "enum", f"{openv} open lead(s)"]
+    running = len(running_now(d))
+    if running:
+        parts.append(f"{col(chr(27) + '[36m')}{SYM['run']} {running} running{n}")
+    parts.append(f"guard {col({'strict': chr(27) + '[32m', 'warn': chr(27) + '[33m'}.get(gm, chr(27) + '[31m'))}{gm}{n}")
+    return dot.join(parts)
+
+def ai_hook_main(argv):
+    """'pentrail ai hook pretooluse|sessionstart', run by Claude Code: the hook JSON comes
+    on stdin, one JSON object goes to stdout. Anything else pentrail would print is held
+    back, so it cannot spoil that object. A guard that fails, fails closed."""
+    event = (argv[0] if argv else "").lower().replace("_", "").replace("-", "")
+    try:
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        raw = ""
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except ValueError:
+        print(json.dumps({"systemMessage": f"{SYM['warn']} pentrail guard: could not read the hook input, "
+                                           "so this call was not checked."}))
+        return 0
+    handler = {"pretooluse": ai_pretooluse, "sessionstart": ai_sessionstart}.get(event)
+    if not handler:
+        print(f"pentrail ai hook: unknown event '{argv[0] if argv else ''}' (pretooluse, sessionstart)",
+              file=sys.stderr)
+        return 1
+    held = io.StringIO()
+    try:
+        with redirect_stdout(held):
+            out = handler(data)
+    except Exception as e:                      # the guard must not crash its way open
+        out = (_pretool("deny", f"pentrail's guard failed on this call ({type(e).__name__}: {e}), so it was "
+                                "not run. Tell the tester.", f"{SYM['err']} pentrail guard error: {e}")
+               if event == "pretooluse" else {"systemMessage": f"{SYM['warn']} pentrail: no brief ({e})"})
+    if out:
+        print(json.dumps(out))
+    return 0
+
+# --- installing the AI layer ------------------------------------------------------------
+# 'pentrail setup' copies the checkout's ai/ folder to ~/.local/share/pentrail/ai;
+# 'pentrail ai install' puts it into one project; 'pentrail ai remove' takes out only
+# what it put there. The stamp .claude/pentrail-ai.json remembers the version, a hash of
+# every file it wrote and every settings entry it added.
+AI_SHARE = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local" / "share") / "pentrail" / "ai"
+AI_STAMP = ".claude/pentrail-ai.json"
+AI_MISSING = ("The AI layer is not on this machine yet. Run 'pentrail setup' from your pentrail checkout "
+              "(its step 'AI layer for Claude Code' copies it to ~/.local/share/pentrail/ai), or point "
+              "pentrail at the checkout: pentrail config src_repo <path>")
+
+def _ai_ok(p):
+    return bool(p) and (Path(p) / "claude" / "CLAUDE.md").is_file() and (Path(p) / "VERSION").is_file()
+
+def _ai_version(p):
+    return _read(Path(p) / "VERSION") or "?"
+
+def _vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")) or (0,)
+
+def _ai_checkout():
+    """The ai/ folder of a pentrail checkout: the one this script runs from, the one you
+    stand in, or the one setup remembered (src_repo). None when there is none."""
+    def cands():
+        yield Path(__file__).resolve().parent
+        yield _git_root(Path.cwd())
+        if CFG.get("src_repo"):
+            yield Path(CFG["src_repo"])
+    return next((Path(c) / "ai" for c in cands()
+                 if c and (Path(c) / "pentrail.py").is_file() and _ai_ok(Path(c) / "ai")), None)
+
+def ai_source():
+    """The AI layer that goes with the pentrail you run: the ai/ folder next to this script
+    (a checkout), else the copy 'pentrail setup' keeps in ~/.local/share/pentrail/ai, else
+    the ai/ folder of the checkout setup remembered. None when there is none."""
+    cands = [Path(__file__).resolve().parent / "ai", AI_SHARE]
+    if CFG.get("src_repo"):
+        cands.append(Path(CFG["src_repo"]) / "ai")
+    return next((p for p in cands if _ai_ok(p)), None)
+
+def ai_share_install(src, dry=False):
+    """Copy a checkout's ai/ folder to ~/.local/share/pentrail/ai, with a stamp saying
+    which version came from where. Returns (the version that was there or None, the new one)."""
+    old = _ai_version(AI_SHARE) if _ai_ok(AI_SHARE) else None
+    new = _ai_version(src)
+    if dry or Path(src).resolve() == AI_SHARE.resolve():
+        return old, new
+    AI_SHARE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AI_SHARE.with_name("ai.new")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(src, tmp, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
+    (tmp / ".stamp.json").write_text(json.dumps({"version": new, "source": str(src), "copied": _now(),
+                                                 "pentrail": VERSION}, indent=2) + "\n")
+    if AI_SHARE.is_symlink():
+        AI_SHARE.unlink()
+    shutil.rmtree(AI_SHARE, ignore_errors=True)
+    tmp.rename(AI_SHARE)
+    return old, new
+
+def ai_share_remove():
+    """Delete the copy setup made (never anything in a project). True if there was one."""
+    if not (AI_SHARE.exists() or AI_SHARE.is_symlink()):
+        return False
+    if AI_SHARE.is_symlink():
+        AI_SHARE.unlink()
+    else:
+        shutil.rmtree(AI_SHARE, ignore_errors=True)
+    try:
+        AI_SHARE.parent.rmdir()                     # ~/.local/share/pentrail, when empty
+    except OSError:
+        pass
+    return True
+
+def _ai_stamp(d):
+    try:
+        s = json.loads((Path(d) / AI_STAMP).read_text())
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _ai_projects():
+    """The projects that have the AI layer, with their stamps."""
+    return [(d, s) for d in _projects() for s in [_ai_stamp(d)] if s]
+
+def _sha_file(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+def _free_name(p):
+    """p, or p.1, p.2 ...: the first name not taken (for backups)."""
+    q, k = p, 1
+    while q.exists():
+        q, k = p.with_name(f"{p.name}.{k}"), k + 1
+    return q
+
+def insert_rules(d, block):
+    """Put the PeTe rules into scope.md once, at the end of '## Rules of engagement' (a new
+    section of that name when it is gone). False when they are there already."""
+    f = Path(d) / SCOPE_DOC
+    text = f.read_text() if f.exists() else ""
+    if "<!-- pentrail:rules -->" in text:
+        return False
+    lines, body = text.split("\n"), block.rstrip("\n").split("\n")
+    idx = next((i for i, l in enumerate(lines) if re.match(r"#{1,6}\s*rules of engagement\b", l.strip(), re.I)), None)
+    if idx is None:
+        at = next((i for i, l in enumerate(lines) if l.startswith("## Resolved into the scope")), len(lines))
+        lines[at:at] = ["## Rules of engagement", ""] + body + [""]
+    else:
+        end = idx + 1
+        while end < len(lines) and not re.match(r"#{1,2}\s", lines[end]):
+            end += 1
+        while end > idx + 1 and not lines[end - 1].strip():
+            end -= 1
+        lines[end:end] = [""] + body
+    f.write_text("\n".join(lines))
+    return True
+
+def _rules_from(src):
+    m = RULES_RE.search(_read(Path(src) / "claude" / "rules.md") + "\n")
+    return m.group(0) if m else RULES_BLOCK
+
+def _settings_sync(path, ours, prev):
+    """Merge our settings into the settings file at 'path', never overwriting yours: rule
+    lists are joined, hook groups added once, env and other keys set only when they are
+    missing. What an earlier install added and 'ours' no longer has is taken out (so
+    ours={} takes all of it out). Returns (the merged settings, what is ours in them)."""
+    try:
+        cur = json.loads(path.read_text()) if path.exists() else {}
+    except ValueError as e:
+        die(f"{path} is not valid JSON ({e}); fix it or move it away, then run this again")
+    perm, hooks, env = (cur.get(k, {}) if isinstance(cur, dict) else None for k in ("permissions", "hooks", "env"))
+    if not all(isinstance(x, dict) for x in (cur, perm, hooks, env)) \
+            or not all(isinstance(v, list) for v in [*(perm.get(k, []) for k in ("allow", "ask", "deny")),
+                                                     *hooks.values()]):
+        die(f"{path} has an unexpected shape; fix it or move it away, then run this again")
+    prev = prev or {}
+    mine = {"permissions": {}, "hooks": {}, "env": [], "keys": []}
+    cur["permissions"], cur["hooks"], cur["env"] = perm, hooks, env
+    for kind in ("allow", "ask", "deny"):
+        want, had = ours.get("permissions", {}).get(kind, []), prev.get("permissions", {}).get(kind, [])
+        lst = [r for r in perm.get(kind, []) if r in want or r not in had]      # our old ones go
+        new = [r for r in want if r not in lst]
+        perm[kind] = lst + new
+        mine["permissions"][kind] = [r for r in want if r in had or r in new]
+        if not perm[kind]:
+            del perm[kind]
+    for ev in sorted(set(ours.get("hooks", {})) | set(prev.get("hooks", {}))):
+        want, had = ours.get("hooks", {}).get(ev, []), prev.get("hooks", {}).get(ev, [])
+        groups = [g for g in hooks.get(ev, []) if g in want or g not in had]
+        new = [g for g in want if g not in groups]
+        hooks[ev] = groups + new
+        mine["hooks"][ev] = [g for g in want if g in had or g in new]
+        if not hooks[ev]:
+            del hooks[ev]
+    for k in set(prev.get("env", [])) - set(ours.get("env", {})):
+        env.pop(k, None)
+    for k, v in ours.get("env", {}).items():
+        if k not in env or k in prev.get("env", []):
+            env[k] = v
+            mine["env"].append(k)
+    rest = {k: v for k, v in ours.items() if k not in ("permissions", "hooks", "env")}
+    for k in set(prev.get("keys", [])) - set(rest):
+        cur.pop(k, None)
+    for k, v in rest.items():
+        if k not in cur or k in prev.get("keys", []):
+            cur[k] = v
+            mine["keys"].append(k)
+    for k in ("permissions", "hooks", "env"):
+        if not cur[k]:
+            del cur[k]
+    return cur, mine
+
+def _group_skills(changes, verb):
+    """'<verb> .claude/skills/x/SKILL.md' lines folded into one when there are many."""
+    many = [c for c in changes if c.startswith(f"{verb} .claude/skills/")]
+    if len(many) <= 3:
+        return changes
+    at = changes.index(many[0])
+    rest = [c for c in changes if c not in many]
+    return rest[:at] + [f"{verb} {len(many)} skills {'in' if verb == 'wrote' else 'from'} .claude/skills/"] + rest[at:]
+
+def ai_install(d, src):
+    """Put the AI layer from 'src' into project d. Safe to run again: it replaces only what
+    it installed itself, keeps your own CLAUDE.md (or a file of ours you changed) as a .bak,
+    merges .claude/settings.json and inserts the PeTe rules into scope.md once. Returns
+    what changed ([] when nothing did)."""
+    d, src = Path(d).resolve(), Path(src)
+    with locked(d):
+        ensure_layout(d)                                # keeps the project folder at 700
+        stamp, changes, files = _ai_stamp(d), [], {}
+        ours = json.loads((src / "claude" / "settings.json").read_text())
+        ours.setdefault("env", {})["PENTRAIL_PROJECT"] = str(d)   # PeTe's commands go to this project
+        sf = d / ".claude" / "settings.json"
+        created = stamp.get("settings_created", not sf.exists())
+        merged, mine = _settings_sync(sf, ours, stamp.get("settings"))   # first: it stops on a bad file
+        (d / ".claude").mkdir(mode=0o700, exist_ok=True)
+        wanted = [("CLAUDE.md", src / "claude" / "CLAUDE.md")] + [
+            (f".claude/skills/{p.name}/SKILL.md", p / "SKILL.md")
+            for p in sorted((src / "claude" / "skills").iterdir()) if (p / "SKILL.md").is_file()]
+        for relp, srcf in wanted:
+            dst, want = d / relp, srcf.read_bytes()
+            if dst.is_file() and dst.read_bytes() != want and _sha_file(dst) != stamp.get("files", {}).get(relp):
+                bak = _free_name(dst.with_name(dst.name + ".bak"))
+                dst.rename(bak)
+                changes.append(f"kept your {relp} as {rel(d, bak)}")
+            if not dst.is_file() or dst.read_bytes() != want:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(want)
+                changes.append(f"wrote {relp}")
+            files[relp] = hashlib.sha256(want).hexdigest()
+        changes = _group_skills(changes, "wrote")
+        for relp, h in (stamp.get("files") or {}).items():      # skills the layer no longer has
+            p = d / relp
+            if relp not in files and p.is_file() and _sha_file(p) == h:
+                p.unlink()
+                changes.append(f"removed {relp}")
+                try:
+                    p.parent.rmdir()
+                except OSError:
+                    pass
+        text = json.dumps(merged, indent=2) + "\n"
+        if not sf.exists() or sf.read_text() != text:
+            _atomic_write(sf, text)
+            changes.append("merged .claude/settings.json" if not created else "wrote .claude/settings.json")
+        if insert_rules(d, _rules_from(src)):
+            changes.append("added the PeTe rules to 0-scope/scope.md")
+        new = {"version": _ai_version(src), "source": str(src), "pentrail": VERSION, "files": files,
+               "settings": mine, "settings_created": created}
+        if changes or {k: v for k, v in stamp.items() if k != "installed"} != new:
+            _atomic_write(d / AI_STAMP, json.dumps(dict(new, installed=_now()), indent=2) + "\n")
+        if changes:
+            log_event("ai", f"PeTe {new['version']} installed: {'; '.join(changes)}", d)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    return changes
+
+def ai_remove(d):
+    """Take the AI layer out of project d: only what it installed, and only the files you
+    did not change since; your own CLAUDE.md comes back from CLAUDE.md.bak. The PeTe
+    rules stay in scope.md. Returns what changed, or None when it was not installed."""
+    d = Path(d).resolve()
+    with locked(d):
+        stamp = _ai_stamp(d)
+        if not stamp:
+            return None
+        changes, sf = [], d / ".claude" / "settings.json"
+        rest = _settings_sync(sf, {}, stamp.get("settings"))[0] if sf.exists() else None  # first: it stops on a bad file
+        for relp, h in (stamp.get("files") or {}).items():
+            p = d / relp
+            if p.is_file() and _sha_file(p) == h:
+                p.unlink()
+                changes.append(f"removed {relp}")
+            elif p.is_file():
+                changes.append(f"kept {relp}: you changed it")
+        bak = d / "CLAUDE.md.bak"
+        if bak.is_file() and not (d / "CLAUDE.md").exists():
+            bak.rename(d / "CLAUDE.md")
+            changes.append("put your CLAUDE.md back")
+        if rest is not None:
+            if not rest and stamp.get("settings_created"):
+                sf.unlink()
+                changes.append("removed .claude/settings.json")
+            else:
+                _atomic_write(sf, json.dumps(rest, indent=2) + "\n")
+                changes.append("took PeTe's entries out of .claude/settings.json")
+        (d / AI_STAMP).unlink()
+        for p in sorted((d / ".claude").rglob("*"), key=lambda p: len(p.parts), reverse=True) + [d / ".claude"]:
+            if p.is_dir():
+                try:
+                    p.rmdir()                               # empty folders only
+                except OSError:
+                    pass
+        changes = _group_skills(changes, "removed")
+        left = sorted(rel(d, f) for f in (d / ".claude").rglob("*") if f.is_file()) if (d / ".claude").is_dir() else []
+        if left:
+            changes.append(f"left yours: {', '.join(left[:4])}{', ...' if len(left) > 4 else ''}")
+        log_event("ai", f"PeTe removed: {'; '.join(changes)} (the PeTe rules stay in 0-scope/scope.md)", d)
+    return changes
+
+def _launcher_version():
+    """The version of the 'pentrail' on your PATH (the one the hooks run), or None."""
+    exe = shutil.which("pentrail")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=10,
+                             env=dict(os.environ, NO_COLOR="1")).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "?"
+    m = re.search(r"pentrail (\S+)", out)
+    return m.group(1) if m else "?"
+
+def _launcher_note(v, want=None):
+    """(level, why) when the hooks cannot run the launcher of version v (err), or it is
+    older than the AI layer 'want' (warn); None when all is well."""
+    if v is None:
+        return "err", "'pentrail' is not on your PATH, and the hooks run it from there: 'pentrail setup' puts it there"
+    if _vtuple(v) < (1, 6):
+        return "err", (f"the 'pentrail' on your PATH is {v}; the hooks need 1.6 or newer and block every "
+                       f"command until then: pentrail update (or pentrail setup)")
+    if want and _vtuple(v) < _vtuple(want):
+        return "warn", f"the 'pentrail' on your PATH is {v}, older than PeTe {want}: pentrail update"
+    return None
+
+def ai_status_rows(d, src):
+    """[(state, label, text)] for 'pentrail ai status'; state is ok, warn, err or info."""
+    rows, stamp = [], _ai_stamp(d) if d else {}
+    avail, inst = (_ai_version(src) if src else None), stamp.get("version")
+    if d:
+        rows.append(("ok", "installed", f"PeTe {inst}  {DIM}since {stamp.get('installed', '?')}{N}") if inst
+                    else ("err", "installed", f"no  {DIM}(pentrail ai install {d.name}){N}"))
+    rows.append(("ok", "available", f"PeTe {avail}  {DIM}{_tilde(src)}{N}") if src
+                else ("warn", "available", f"none on this machine  {DIM}(pentrail setup){N}"))
+    if inst and avail and _vtuple(avail) > _vtuple(inst):
+        rows.append(("warn", "update", f"PeTe {avail} is there: pentrail ai update {d.name}"))
+    if inst:
+        files = stamp.get("files") or {}
+        missing = [f for f in files if not (d / f).is_file()]
+        changed = [f for f in files if (d / f).is_file() and _sha_file(d / f) != files[f]]
+        nskill = sum(1 for f in files if f.startswith(".claude/skills/"))
+        rows.append(("err", "files", f"missing: {', '.join(missing)}  {DIM}(pentrail ai update){N}") if missing
+                    else ("ok", "files", f"CLAUDE.md and {nskill} skills"))
+        if changed:
+            rows.append(("info", "changed", f"by you: {', '.join(changed)}  {DIM}(an update keeps them as .bak){N}"))
+        try:
+            s = json.loads((d / ".claude" / "settings.json").read_text())
+        except (OSError, ValueError):
+            s = {}
+        hk = json.dumps(s.get("hooks", {}))
+        lost = [n for n, c in (("guardrail", "ai hook pretooluse"), ("session brief", "ai hook sessionstart"))
+                if c not in hk]
+        rows.append(("err", "hooks", f"missing: {', '.join(lost)}  {DIM}(pentrail ai update){N}") if lost
+                    else ("ok", "hooks", "the guardrail and the session brief"))
+        pin = (s.get("env") or {}).get("PENTRAIL_PROJECT")
+        rows.append(("ok", "project", "PENTRAIL_PROJECT points here") if pin == str(d)
+                    else ("warn", "project", f"PENTRAIL_PROJECT is {pin or 'not set'}  {DIM}(pentrail ai update){N}"))
+    if d:
+        has = "<!-- pentrail:rules -->" in _read(d / SCOPE_DOC)
+        rows.append(("ok", "rules", "the PeTe rules are in 0-scope/scope.md") if has
+                    else ("warn" if inst else "info", "rules", "not in 0-scope/scope.md  "
+                          f"{DIM}(pentrail ai install adds them){N}"))
+    v = _launcher_version()
+    note = _launcher_note(v, inst or avail)
+    rows.append(note and (note[0], "launcher", note[1])
+                or ("ok", "launcher", f"the hooks run pentrail {v}  {DIM}{_tilde(shutil.which('pentrail'))}{N}"))
+    cc = shutil.which("claude")
+    rows.append(("ok", "claude", f"Claude Code  {DIM}{_tilde(cc)}{N}") if cc
+                else ("warn", "claude", f"Claude Code not found  {DIM}(https://code.claude.com){N}"))
+    return rows
+
+def _tilde(p):
+    """A path for the screen: ~/... when it is under your home folder."""
+    try:
+        return "~/" + str(Path(p).relative_to(HOME))
+    except ValueError:
+        return str(p)
+
+def _cd(p):
+    """A cd command for p that you can paste: cd ~/pentests/box1."""
+    t = _tilde(p)
+    return "cd " + ("~/" + shlex.quote(t[2:]) if t.startswith("~/") else shlex.quote(t))
+
+def _ai_target(name):
+    """The project an 'ai' command works on: the one named, else the active one."""
+    if name:
+        d = resolve_project(name)
+        if not d or not ((d / "state.json").exists() or (d / "logbook.md").exists()):
+            die(f"No pentrail project '{name}' (see 'pentrail list')")
+        return Path(d).resolve()
+    return Path(require_engagement()).resolve()
+
+def ai_installed_msg(d, changes, old=None):
+    """What 'ai install', 'ai update' and 'new --ai' print."""
+    stamp = _ai_stamp(d)
+    ver, nskill = stamp.get("version", "?"), sum(1 for f in stamp.get("files", {}) if "/skills/" in f)
+    if not changes:
+        print_pete(f"{BOLD}PeTe {ver}{N} is in {BOLD}{d.name}{N} already", f"{DIM}nothing to change{N}")
+    else:
+        print_pete(f"{BOLD}PeTe {ver}{N} is in {BOLD}{d.name}{N}" + (f"  {DIM}(was {old}){N}" if old else ""),
+                   f"{DIM}CLAUDE.md {SYM['dot']} {nskill} skills {SYM['dot']} guardrail hooks {SYM['dot']} "
+                   f"PeTe rules in 0-scope/scope.md{N}",
+                   f"start it:  {G}{_cd(d)} && claude{N}")
+        for c in changes:
+            print(f"      {DIM}{SYM['dot']} {c}{N}")
+    note = _launcher_note(_launcher_version(), ver)
+    if note:
+        warn(note[1])
+
+AI_USAGE = ("Usage: pentrail ai install|update|remove|status [project]   |   pentrail ai update|status --all"
+            "   |   pentrail ai brief   |   pentrail ai hook pretooluse|sessionstart, ai statusline (run by Claude Code)")
+AI_MARK = {"ok": (G, "ok"), "warn": (Y, "warn"), "err": (R, "err"), "info": (B, "info")}
+
+def cmd_ai(args):
+    """PeTe, the AI layer: put it into a project, update or remove it, its status, the
+    session brief, and the hooks Claude Code calls."""
+    act, rest = (args.action or "").lower(), list(args.rest or [])
+    if act == "hook":
+        sys.exit(ai_hook_main(rest))
+    flags, names = {a for a in rest if a.startswith("-")}, [a for a in rest if not a.startswith("-")]
+    if act == "brief":
+        d = ai_project(fallback=True)
+        if not d:
+            die("No pentrail project here and none active: pentrail new <name> <target>")
+        st = load_state(d)
+        if sys.stdout.isatty():
+            print_pete(f"{BOLD}PeTe{N} {DIM}the pentrail assistant{N}",
+                       f"session brief for {BOLD}{d.name}{N}",
+                       f"{DIM}what PeTe reads when a Claude Code session starts{N}")
+            print()
+        print(ai_brief(d, st))
+        return
+    if act not in ("install", "update", "remove", "status") or len(names) > 1 or flags - {"--all"} \
+            or (flags and (names or act in ("install", "remove"))):
+        die(AI_USAGE)
+    every = "--all" in flags
+    if act == "status":
+        src = ai_source()
+        if every:
+            have = _ai_projects()
+            newer = lambda s: src and _vtuple(_ai_version(src)) > _vtuple(s.get("version"))
+            box(f"PeTe {SYM['dot']} {len(have)} project(s)", ([
+                f"{Y + SYM['warn'] if newer(s) else G + SYM['ok']}{N} {d.name:<20} PeTe {s.get('version', '?')}"
+                f"  {DIM}since {s.get('installed', '?')}{N}" for d, s in have]
+                or [f"{DIM}none yet: pentrail ai install <project>{N}"])
+                + [f"{DIM}available: PeTe {_ai_version(src)} ({_tilde(src)}){N}" if src
+                   else f"{DIM}available: none on this machine (pentrail setup){N}"])
+            return
+        d = _ai_target(names[0]) if names else current_dir()
+        d = Path(d).resolve() if d else None
+        rows = ai_status_rows(d, src)
+        box(f"PeTe {SYM['dot']} {d.name}" if d else "PeTe", [
+            f"{AI_MARK[s][0]}{SYM[AI_MARK[s][1]]}{N} {DIM}{label:<9}{N} {text}" for s, label, text in rows])
+        sys.exit(1 if any(s == "err" for s, _, _ in rows) else 0)
+    if act == "remove":
+        d = _ai_target(names[0] if names else None)
+        changes = ai_remove(d)
+        if changes is None:
+            info(f"PeTe is not in {d.name} ({AI_STAMP} is not there), so there is nothing to remove.")
+            return
+        ok(f"PeTe is out of {BOLD}{d.name}{N}. The PeTe rules stay in 0-scope/scope.md; your own files were not touched.")
+        for c in changes:
+            print(f"    {DIM}{SYM['dot']} {c}{N}")
+        return
+    src = ai_source() or die(AI_MISSING)
+    if act == "install":
+        d = _ai_target(names[0] if names else None)
+        ai_installed_msg(d, ai_install(d, src))
+        return
+    targets = [d for d, _ in _ai_projects()] if every else [_ai_target(names[0] if names else None)]
+    if every and not targets:
+        info("No project has PeTe yet: pentrail ai install <project>")
+        return
+    for d in targets:
+        old = _ai_stamp(d).get("version")
+        if not old:
+            die(f"PeTe is not in {d.name} yet: pentrail ai install {d.name}")
+        changes = ai_install(d, src)
+        if every:
+            ok(f"{d.name:<20} PeTe {old}" + (f" {SYM['next']} {_ai_version(src)}" if old != _ai_version(src) else "")
+               + f"  {DIM}{len(changes)} change(s){N}")
+        else:
+            ai_installed_msg(d, changes, old if old != _ai_version(src) else None)
+    if every:
+        note = _launcher_note(_launcher_version(), _ai_version(src))
+        if note:
+            warn(note[1])
+
 # ----------------------------------------------------------------------------- config
 def cmd_config(args):
     if not args.key:
@@ -4527,6 +6411,11 @@ def cmd_config(args):
             die(f"{args.key} must be an integer (got {args.value!r})")
     if args.key == "scope_guard" and val not in GUARD_MODES:
         die(f"scope_guard is one of: {', '.join(GUARD_MODES)}")
+    if args.key in ONOFF_KEYS:
+        v = str(val).strip().lower()
+        val = "on" if v in ("on", "true", "yes", "1") else "off" if v in ("off", "false", "no", "0") else None
+        if val is None:
+            die(f"{args.key} is on or off")
     set_config(args.key, val)
     ok(f"{args.key} = {val}  (saved to {CONFIG_FILE})")
 # ----------------------------------------------------------------------------- /etc/hosts
@@ -4576,9 +6465,9 @@ def _write_hosts(path, lines):
 def cmd_doctor(args):
     """Environment self-check: what is installed, what is missing, and how to fix it."""
     def row(label, present, hint=""):
-        mark = f"{G}ok{N}" if present else f"{R}--{N}"
+        mark = f"{G}{SYM['ok']}{N}" if present else f"{R}{SYM['err']}{N}"
         tail = f"  {DIM}{hint}{N}" if hint else ""
-        print(f"  [{mark}] {label}{tail}")
+        print(f"  {mark} {label}{tail}")
 
     py = sys.version_info
     print(f"{B}pentrail {VERSION}{N}   Python {py.major}.{py.minor}.{py.micro}   {sys.platform}\n")
@@ -4601,6 +6490,18 @@ def cmd_doctor(args):
         if not p: missing.append(tool)
         row(tool, bool(p), p or (f"sudo apt install {apt}" if apt else ""))
 
+    print(f"\n{B}Launcher{N}")
+    exe = shutil.which("pentrail")
+    if not exe:
+        row("pentrail on your PATH", False, "not there: 'pentrail setup' installs it")
+    elif Path(exe).resolve() == Path(__file__).resolve():
+        row(f"pentrail on your PATH: {exe}", True, "this one")
+    else:
+        v = _launcher_version()
+        fresh = _vtuple(v) >= _vtuple(VERSION)
+        row(f"pentrail on your PATH: {exe} ({v})", fresh,
+            "" if fresh else f"older than this pentrail ({VERSION}): pentrail update, or setup from the checkout")
+
     print(f"\n{B}Config & paths{N}")
     row(f"config file: {CONFIG_FILE}", CONFIG_FILE.exists(),
         "" if CONFIG_FILE.exists() else "created on first 'config' set")
@@ -4622,11 +6523,18 @@ def cmd_doctor(args):
     row(f"web_tool: {CFG['web_tool']}", bool(shutil.which(CFG["web_tool"])),
         "" if shutil.which(CFG["web_tool"]) else "install it or 'pentrail config web_tool <other>'")
     print(f"  {DIM}redact list: {len(load_redacts())} secret(s){N}")
+
+    print(f"\n{B}AI layer{N} (optional: PeTe for Claude Code; pentrail works without it)")
+    src = ai_source()
+    row(f"PeTe {_ai_version(src)}: {_tilde(src)}" if src else "PeTe", bool(src),
+        "" if src else "not on this machine; 'pentrail setup' copies it (step 5)")
+    cc = shutil.which("claude")
+    row(f"claude: {cc}" if cc else "claude (Claude Code)", bool(cc), "" if cc else "https://code.claude.com")
     d = current_dir()
     if d:
         print(f"  {DIM}active project: {d.name}{N}")
     if missing:
-        print(f"\n{Y}[!]{N} {len(missing)} tool(s) missing: {', '.join(missing)}")
+        print(f"\n{Y}{SYM['warn']}{N} {len(missing)} tool(s) missing: {', '.join(missing)}")
         info("Install them automatically with:  pentrail setup")
     if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
         warn("Running under sudo; run pentrail as your normal user.")
@@ -4671,6 +6579,40 @@ def _remember_src_repo(repo):
     except OSError:
         pass
 
+def _step(title):
+    """A section header for setup and uninstall:  ── 1. Launcher ──────────"""
+    h = _u("─", "-")
+    print(f"{B}{h * 2}{N} {BOLD}{title}{N} {B}{h * max(4, 60 - _vlen(title))}{N}")
+
+def _same_tree(a, b):
+    """True when folder b holds exactly the files of folder a, byte for byte (a stamp aside)."""
+    def files(root):
+        return {str(f.relative_to(root)): f for f in Path(root).rglob("*")
+                if f.is_file() and f.name != ".stamp.json" and "__pycache__" not in f.parts}
+    fa, fb = files(a), files(b)
+    return fa.keys() == fb.keys() and all(fa[k].read_bytes() == fb[k].read_bytes() for k in fa)
+
+def _ai_share_step(src, ask, dry, verb):
+    """Copy (setup) or refresh (update) the AI layer in ~/.local/share/pentrail/ai from a
+    checkout's ai/ folder. Projects are left alone. True when PeTe is there afterwards."""
+    old, new = ai_share_install(src, dry=True)
+    if old == new and _same_tree(src, AI_SHARE):
+        ok(f"PeTe {new} is in {_tilde(AI_SHARE)}, up to date")
+    elif not ask(f"{verb} PeTe {new} {'to' if verb == 'Copy' else 'in'} {_tilde(AI_SHARE)}"
+                 + (f" (now {old})?" if old else "?")):
+        info("Skipped; projects keep the PeTe they have.")
+        return bool(old)
+    elif dry:
+        info(f"[dry-run] would copy {src} to {_tilde(AI_SHARE)}")
+    else:
+        ai_share_install(src)
+        ok(f"PeTe {new} is in {_tilde(AI_SHARE)}" + (f" (was {old})" if old and old != new else ""))
+    stale = [d.name for d, st in _ai_projects() if _vtuple(st.get("version")) < _vtuple(new)]
+    if stale:
+        info(f"{len(stale)} project(s) have an older PeTe ({', '.join(stale[:4])}"
+             f"{', ...' if len(stale) > 4 else ''}): pentrail ai update --all")
+    return True
+
 def _append_shell_helper(assume_yes, dry):
     """Offer to add the pcd() helper to the user's shell rc, idempotently."""
     block = ("\n# >>> pentrail >>>\n"
@@ -4704,7 +6646,7 @@ def cmd_setup(args):
     yes = args.yes
     def ask(m):
         if yes:
-            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+            print(f"{Y}{SYM['ask']}{N} {m} [y/N] y"); return True
         return confirm(m)
     def run(cmd):
         info("$ " + " ".join(cmd))
@@ -4714,6 +6656,16 @@ def cmd_setup(args):
             return subprocess.call(cmd)
         except OSError as e:
             err(f"could not run {cmd[0]}: {e}"); return 1
+    def opt(key, m):
+        """An option that stays off until you turn it on: asked only when you are there."""
+        if cfg_on(key):
+            ok(f"{key} is on  {DIM}(pentrail config {key} off turns it off){N}")
+        elif yes or dry:
+            print(f"  {DIM}{key} stays off; turn it on with: pentrail config {key} on{N}")
+        elif confirm(m):
+            set_config(key, "on"); ok(f"{key} = on")
+        else:
+            print(f"  {DIM}{key} stays off; later: pentrail config {key} on{N}")
 
     print_banner()
     print(f"\n{DIM}Guided setup. Nothing is installed without asking"
@@ -4724,7 +6676,7 @@ def cmd_setup(args):
 
     # 1. Put pentrail on PATH ------------------------------------------------
     if not args.no_launcher:
-        print(f"{B}1. Launcher{N}")
+        _step("1. Launcher")
         print(f"  {DIM}Copies this script to /usr/local/bin so you can run 'pentrail' from any")
         print(f"  directory instead of 'python3 pentrail.py'. Needs sudo once to write there.{N}")
         target = Path("/usr/local/bin/pentrail")
@@ -4749,7 +6701,7 @@ def cmd_setup(args):
 
     # 2. Install missing tools ----------------------------------------------
     if not args.no_tools:
-        print(f"{B}2. Tools{N}")
+        _step("2. Tools")
         print(f"  {DIM}Core tools (openvpn, ip, ping, script) are what pentrail itself needs for")
         print(f"  the VPN and capture. Enumeration tools (nmap, ffuf, smbclient, ...) are what")
         print(f"  'pentrail next' suggests - install the ones you use. Installed via apt, with")
@@ -4787,7 +6739,7 @@ def cmd_setup(args):
         print()
 
     # 3. Config: where your .ovpn files live --------------------------------
-    print(f"{B}3. Config{N}")
+    _step("3. Config")
     print(f"  {DIM}vpn_dir is the folder pentrail looks in for your .ovpn files. wordlist is")
     print(f"  the directory list 'pentrail next' uses for web brute-forcing. Config is saved")
     print(f"  to {CONFIG_FILE}.{N}")
@@ -4796,7 +6748,7 @@ def cmd_setup(args):
     new_vpn = args.vpn_dir
     if new_vpn is None and not yes:
         try:
-            ans = input(f"{Y}[?]{N} vpn_dir (where your .ovpn files live) [{cur_vpn}]: ").strip()
+            ans = input(f"{Y}{SYM['ask']}{N} vpn_dir (where your .ovpn files live) [{cur_vpn}]: ").strip()
         except EOFError:
             ans = ""
         new_vpn = ans or None
@@ -4837,7 +6789,7 @@ def cmd_setup(args):
             choice = found[0]
             if not yes:
                 try:
-                    ans = input(f"{Y}[?]{N} use which? [1-{len(found)}, Enter={B}1{N}, s=skip] ").strip().lower()
+                    ans = input(f"{Y}{SYM['ask']}{N} use which? [1-{len(found)}, Enter={B}1{N}, s=skip] ").strip().lower()
                 except EOFError:
                     ans = ""
                 if ans in ("s", "skip"):
@@ -4855,10 +6807,14 @@ def cmd_setup(args):
                 cfg["wordlist"] = str(choice)
                 save_config({k: cfg.get(k, DEFAULTS[k]) for k in DEFAULTS})
                 ok(f"wordlist = {choice}")
+    CFG.update(load_config())
+    print(f"  {DIM}auto_shot: in a capture, every command that finds something (a port, a path, a")
+    print(f"  lead) is kept as evidence, its command line and output, without any AI.{N}")
+    opt("auto_shot", "Keep a screenshot of every command that finds something (auto_shot)?")
     print()
 
     # About the VPN ----------------------------------------------------------
-    print(f"{B}About the VPN{N}")
+    _step("About the VPN")
     print(f"  {DIM}pentrail connects with 'pentrail up' / 'pentrail new', not here. openvpn runs")
     print(f"  as root (sudo, for the tun device and routes) and as a background daemon, so it")
     print(f"  stays up after you close the terminal or exit pentrail - you do not need a")
@@ -4868,17 +6824,38 @@ def cmd_setup(args):
 
     # 4. Shell helper --------------------------------------------------------
     if not args.no_shell:
-        print(f"{B}4. Shell helper{N}")
+        _step("4. Shell helper")
         print(f"  {DIM}Adds a pcd() function to your shell so one word jumps into the active")
         print(f"  project with $TARGET/$VPN_IP set. cd must happen in your own shell, so it")
         print(f"  cannot be a pentrail command. Added once; safe to re-run.{N}")
         _append_shell_helper(yes, dry)
         print()
 
+    # 5. The AI layer --------------------------------------------------------
+    pete = False
+    if not args.no_ai:
+        _step("5. AI layer for Claude Code (optional)")
+        print(f"  {DIM}PeTe is pentrail's assistant for Claude Code: a master prompt, skills for scoping,")
+        print(f"  recon, enumeration, triage and reporting, and hooks that keep it in scope. This copies")
+        print(f"  it to {_tilde(AI_SHARE)}; a project gets it only with 'pentrail ai install'")
+        print(f"  or 'pentrail new --ai'. pentrail works the same without it.{N}")
+        src = _ai_checkout()
+        if not src:
+            info("No pentrail checkout with an ai/ folder found: run setup from your clone to add PeTe.")
+        elif _ai_share_step(src, ask, dry, "Copy"):
+            pete = True
+            opt("ai_auto", "Put PeTe into every new project (ai_auto, same as 'new --ai')?")
+            note = _launcher_note(_launcher_version(), _ai_version(src))
+            if note and not dry:
+                warn(note[1])
+        print()
+
     # Done -------------------------------------------------------------------
-    print(f"{B}Next{N}")
+    _step("Next")
     _cmd("pentrail doctor", "re-check the environment")
     _cmd("pentrail new box1 10.10.10.5", "start your first project")
+    if pete:
+        _cmd("pentrail new box1 10.10.10.5 --ai", "... with PeTe, then: cd into it && claude")
     print(f"  {DIM}tip: pentrail config default_vpn <file.ovpn> skips the VPN picker{N}")
 
 def cmd_update(args):
@@ -4889,7 +6866,7 @@ def cmd_update(args):
     yes = args.yes
     def ask(m):
         if yes:
-            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+            print(f"{Y}{SYM['ask']}{N} {m} [y/N] y"); return True
         return confirm(m)
     def run(cmd):
         info("$ " + " ".join(cmd))
@@ -4953,7 +6930,11 @@ def cmd_update(args):
     elif not dry:
         ok(f"Pulled: version {old} -> {new}.")
 
-    # 2. Reinstall the launcher ---------------------------------------------
+    # 2. The AI layer: refresh the copy setup made, if you have one ------------
+    if _ai_ok(repo / "ai") and _ai_ok(AI_SHARE):
+        _ai_share_step(repo / "ai", ask, dry, "Refresh")
+
+    # 3. Reinstall the launcher ---------------------------------------------
     if args.no_install:
         info("Skipped reinstall (--no-install)."); return
     target = Path("/usr/local/bin/pentrail")
@@ -4995,14 +6976,15 @@ def _remove_shell_helper(assume_yes, dry):
         info("No pcd() helper found in your shell rc.")
 
 def cmd_uninstall(args):
-    """Undo 'pentrail setup': remove the /usr/local/bin launcher and the pcd shell
-    helper; with --config also remove config + VPN state. Your pentest projects are
-    never deleted. Uses sudo only to remove the launcher."""
+    """Undo 'pentrail setup': remove the /usr/local/bin launcher, the pcd shell helper
+    and the AI layer's copy in ~/.local/share/pentrail; with --config also remove config
+    + VPN state. Your pentest projects are never deleted (nor PeTe in them). Uses sudo
+    only to remove the launcher."""
     dry = args.dry_run
     yes = args.yes
     def ask(m):
         if yes:
-            print(f"{Y}[?]{N} {m} [y/N] y"); return True
+            print(f"{Y}{SYM['ask']}{N} {m} [y/N] y"); return True
         return confirm(m)
     def run(cmd):
         info("$ " + " ".join(cmd))
@@ -5014,7 +6996,7 @@ def cmd_uninstall(args):
             err(f"could not run {cmd[0]}: {e}"); return 1
 
     print_banner()
-    print(f"\n{DIM}Removes the launcher and shell helper. Your pentest projects are never "
+    print(f"\n{DIM}Removes the launcher, the shell helper and the AI layer's copy. Your pentest projects are never "
           f"deleted.{' (dry run: nothing will change)' if dry else ''}{N}\n")
 
     # 0. A running VPN is a root daemon that would be orphaned once the launcher is
@@ -5028,7 +7010,7 @@ def cmd_uninstall(args):
                 info("[dry-run] would run 'pentrail down'")
 
     # 1. Launcher ------------------------------------------------------------
-    print(f"{B}1. Launcher{N}")
+    _step("1. Launcher")
     target = Path("/usr/local/bin/pentrail")
     paths = []
     def consider(p):
@@ -5039,22 +7021,40 @@ def cmd_uninstall(args):
             return
         if p.exists() or p.is_symlink():
             paths.append(p)
-    consider(target)
-    w = shutil.which("pentrail")
-    if w:
-        consider(Path(w))
-    if not paths:
-        info("No installed launcher found (nothing in /usr/local/bin or on $PATH).")
+    if args.no_launcher:
+        info("Kept the launcher (--no-launcher).")
+    else:
+        consider(target)
+        w = shutil.which("pentrail")
+        if w:
+            consider(Path(w))
+        if not paths:
+            info("No installed launcher found (nothing in /usr/local/bin or on $PATH).")
     for p in paths:
         if ask(f"Remove {p} (sudo)?") and run([*SUDO, "rm", "-f", str(p)]) == 0 and not dry:
             ok(f"Removed {p}")
 
     # 2. Shell helper --------------------------------------------------------
-    print(f"\n{B}2. Shell helper{N}")
+    print(); _step("2. Shell helper")
     _remove_shell_helper(yes, dry)
 
-    # 3. Settings & VPN state (opt-in) --------------------------------------
-    print(f"\n{B}3. Settings & VPN state{N}")
+    # 3. The AI layer's copy (never the projects that have it) --------------
+    print(); _step("3. AI layer")
+    if not (AI_SHARE.exists() or AI_SHARE.is_symlink()):
+        info(f"No copy of the AI layer in {_tilde(AI_SHARE)}.")
+    elif ask(f"Remove PeTe's copy in {_tilde(AI_SHARE)}?"):
+        if dry:
+            info(f"[dry-run] would delete {_tilde(AI_SHARE)}")
+        else:
+            ai_share_remove(); ok(f"Removed {_tilde(AI_SHARE)}")
+    have = _ai_projects()
+    if have:
+        print(f"  {DIM}PeTe stays in {len(have)} project(s): {', '.join(d.name for d, _ in have[:6])}"
+              f"{', ...' if len(have) > 6 else ''}. Its hooks run 'pentrail', so without it PeTe's commands")
+        print(f"  are blocked there. 'pentrail ai remove <project>' takes it out of one.{N}")
+
+    # 4. Settings & VPN state (opt-in) --------------------------------------
+    print(); _step("4. Settings & VPN state")
     cfgdir, statedir = CONFIG_FILE.parent, STATE_DIR
     if args.config:
         for p in (cfgdir, statedir):
@@ -5071,7 +7071,7 @@ def cmd_uninstall(args):
 
     # 4. Projects are never auto-deleted ------------------------------------
     base = Path(CFG["base_dir"])
-    print(f"\n{B}Your work is safe{N}")
+    print(); _step("Your work is safe")
     print(f"  {DIM}pentest projects in {base} were NOT touched - delete them yourself if "
           f"you want them gone.{N}")
     if not dry:
@@ -5085,7 +7085,8 @@ HELP_SECTIONS = [
                             "Targets may be IPs, ranges, domains or *.domain. --no-vpn to skip it."),
         ("capture [phase] [--warn]", "Record your shell: every command with its time, the scope guard,",
                             "and what the output shows goes into the phase docs."),
-        ("next",            "What to enumerate next on the active box, ticked off as you go."),
+        ("next [host]",     "What to enumerate next on the active box, ticked off as you go,",
+                            "plus coverage: full TCP, -sV, UDP top ports, vhosts. --json too."),
         ("finding <id|title>", "Turn a confirmed lead into a finding file for the report."),
         ("report [--html|--pdf]", "Fill 5-report/report.md from your docs and findings; export it."),
     ]),
@@ -5101,19 +7102,23 @@ HELP_SECTIONS = [
     ("SCOPE", [
         ("scope",           "Show the scope from 0-scope/scope.md and the guard mode."),
         ("scope add|out <asset...>", "Add to In scope / Out of scope (IP, range, domain, *.domain, URL)."),
-        ("scope check <host|cmd>", "Is this in scope? Works on a whole command line too."),
+        ("scope check <host|cmd>", "Is this in scope? Works on a whole command line too.",
+                            "Exit 0 in, 3 out / not in scope / conflict, 2 no host, 4 no scope; --json."),
         ("scope resolve",   "Look up the names pentrail knows; names in your ranges join the",
                             "scope, contradictions (out-of-scope name in a range) are listed."),
         ("scope guard strict|warn|off", "strict stops out-of-scope commands, warn only reports them",
                             "(logged). Outside a capture: the setting; inside: this capture only."),
     ]),
     ("WHAT YOU FOUND", [
-        ("hosts [host]",    "Hosts with their ports; one host shows ports, web, names, leads."),
+        ("hosts [host]",    "Hosts with their ports; one host shows ports, web, names, leads.",
+                            "--json: the same as JSON, without credentials."),
         ("names [--plain]", "Hostnames and subdomains seen in scope (--plain: one per line)."),
         ("vector(s) [type]", "Leads, sorted by status. vector add | <status> <id> | rm <id>."),
         ("cred(s)",         "Credentials: cred add <user:secret> | users | hashes | export."),
         ("flag <name> <value>", "Record a flag (user/root also marks the box owned)."),
-        ("shot [-l label] <cmd>", "Run a command and keep a screenshot + text as evidence."),
+        ("shot [-l label] <cmd>", "Run a command and keep a screenshot + text as evidence.",
+                            "-q: print only 'Saved:' + what was new, exit with the tool's code;",
+                            "--by <name> (or $PENTRAIL_ACTOR): who ran it, for the record."),
         ("shot --last [lines]", "During a capture: screenshot what you just ran."),
         ("ingest <file>",   "Read a saved tool output (nmap -oN/-oX, ffuf, gobuster, ...)."),
         ("note [-t host] <text>", "A quick note on the active box (or another host); in notes.md",
@@ -5121,6 +7126,25 @@ HELP_SECTIONS = [
         ("notes [host]",    "List notes (one host: its own and those that mention it);",
                             "notes edit <N> \"<text>\" / notes rm <N>."),
         ("log [n]",         "The logbook: everything that happened, with times."),
+    ]),
+    ("TRACE  (what ran, by you or an AI assistant)", [
+        ("seen <host> <tool|script|text>", "Already run against that host (or running now)? Exit 0 with the",
+                            "commands, 1 if not. ffuf/feroxbuster/gobuster/... count as one tool."),
+        ("trace [-H host] [-t tool]", "What ran per host: time, phase, who, capture/shot/ingest, output",
+                            "file, and what runs right now. --json for scripts."),
+        ("show <id> [-n lines]", "The recorded output of one command, from its command line on."),
+    ]),
+    ("PeTe  (optional: the AI layer for Claude Code; pentrail works without it)", [
+        ("new <name> <target> --ai", "A new project with PeTe in it (config ai_auto on: always)."),
+        ("ai install [project]", "Put PeTe into a project: CLAUDE.md, skills, settings, hooks,",
+                            "the PeTe rules in scope.md. Safe to run again; your files are kept."),
+        ("ai status [project|--all]", "Installed or not, which version, what is missing or newer."),
+        ("ai update [project|--all]", "Bring PeTe in a project (or all of them) to the version you have."),
+        ("ai remove [project]", "Take out what ai install put in; the PeTe rules stay in scope.md."),
+        ("ai brief",        "The session brief PeTe reads when a Claude Code session starts."),
+        ("ai hook <event>", "Run by Claude Code: the guardrail before every command PeTe runs",
+                            "(pretooluse) and the brief at the start (sessionstart)."),
+        ("ai statusline",   "Run by Claude Code: the status line (project, box, leads, guard)."),
     ]),
     ("HOSTS & MOVEMENT", [
         ("host add|own|rm <ip>", "Track a host, mark it owned, or stop tracking it."),
@@ -5136,7 +7160,7 @@ HELP_SECTIONS = [
         ("focus <text>",    "What you are on right now (home screen)."),
         ("redact add <value>", "Your OWN secrets, scrubbed from every capture (hashes only)."),
         ("resolve [ip] <name...>", "Add /etc/hosts entries; --clean removes pentrail's own."),
-        ("config [key] [value]", "Settings: base_dir, vpn_dir, scope_guard, author, wordlist, ..."),
+        ("config [key] [value]", "Settings: base_dir, vpn_dir, scope_guard, author, auto_shot, ai_auto, ..."),
         ("doctor / setup / update / uninstall", "Check, install, update or remove pentrail."),
         ("version",         "Print the version."),
     ]),
@@ -5156,8 +7180,27 @@ BANNER = r"""
  |_|   the pentest logbook  v%s
 """.strip("\n")
 
+# The same name in box-drawing letters, with a trail leading to the version.
+LOGO = ("┌─┐┌─┐┌┐┌┌┬┐┬─┐┌─┐┬┬  ", "├─┘├┤ │││ │ ├┬┘├─┤││  ", "┴  └─┘┘└┘ ┴ ┴└─┴ ┴┴┴─┘")
+
 def print_banner():
-    print(f"{B}{BANNER % VERSION}{N}")
+    if not _UTF:
+        print(f"{B}{BANNER % VERSION}{N}")
+        return
+    tail = ("", f"   {DIM}the pentest logbook{N}", f"  {B}·  ·  ·  ·  ·  ·{N} {G}▸ v{VERSION}{N}")
+    print()
+    for row, t in zip(LOGO, tail):
+        print(f"   {C}{BOLD}{row}{N}{t}")
+
+# PeTe, the AI layer's assistant, for the pentrail ai commands.
+PETE_FACE = (("      ┬", "      |"), ("   ╭──┴──╮", "   .--+--."), ("   │ ◕ ◕ │", "   | o o |"),
+             ("   │  ▿  │", "   |  v  |"), ("   ╰─┬─┬─╯", "   '-+-+-'"))
+
+def print_pete(*lines):
+    """PeTe's face, with up to three lines of text beside it."""
+    text = ("", "", *lines, "", "", "")
+    for (fancy, plain), t in zip(PETE_FACE, text):
+        print(f"{M}{_u(fancy, plain):<10}{N}" + (f"   {t}" if t else ""))
 
 def _cmd(c, text):
     print(f"  {G}{c:<34}{N}{text}")
@@ -5200,7 +7243,7 @@ DETAILS = {
          "Label is free text: recon, web, sqli, privesc, lateral, whatever fits."],
         "pentrail capture privesc"),
     "shot": ("Keep a terminal screenshot as evidence, hands-off.",
-        "pentrail shot [-l label] <command ...>   |   pentrail shot --last [lines]",
+        "pentrail shot [-q] [--by name] [-l label] <command ...>   |   pentrail shot --last [lines]",
         ["<command>: checks it against the scope, runs it once, saves a PNG (via termshot)",
          " and the text to the current phase's evidence/ folder (<box>_<date>_<label>), logs",
          " it, scrubs your redacted secrets, and reads the output like a capture does, with",
@@ -5210,8 +7253,15 @@ DETAILS = {
          " interactively, without re-running it. It needs a capture, because a tool cannot",
          " read your terminal scrollback by itself.",
          "No termshot installed? It still saves text evidence and parses it; set a renderer",
-         " with 'pentrail config termshot_cmd <cmd>'."],
-        "pentrail shot -l whoami id   ;   (in a capture) pentrail shot --last"),
+         " with 'pentrail config termshot_cmd <cmd>'.",
+         "-q / --quiet: the same, but it prints only 'Saved:' and what was new (the output is",
+         " in the evidence file) and exits with the tool's own exit code. Exit 3 always means",
+         " the scope guard stopped it (BLOCKED goes to stderr); a tool's own 3 becomes 1.",
+         "--by <name>, or PENTRAIL_ACTOR=<name> in the environment, records who ran it (an AI",
+         " assistant, a script). It shows in the logbook, in 'Found by' and in the commands",
+         " tables of the docs and the report. Without it, the command is yours. A command with",
+         " a name like that never overrides the scope guard: scope-ok is refused (exit 3)."],
+        "pentrail shot -l whoami id   ;   pentrail shot -q --by pete -l web -- curl -sI http://10.10.10.5"),
     "ingest": ("Same parsing as capture, but on a file you already saved.",
         "pentrail ingest <file>",
         ["Reads any tool output (gobuster, ffuf, nmap, enum scripts, ...) and extracts",
@@ -5242,15 +7292,19 @@ DETAILS = {
          "Nothing is changed; it only reports. Run it once after installing pentrail."],
         "pentrail doctor"),
     "setup": ("Get from a fresh Kali to a ready pentrail in one guided command.",
-        "pentrail setup [--yes] [--core-only] [--vpn-dir PATH] [--no-tools|--no-launcher|--no-shell] [--dry-run]",
-        ["Walks four steps and explains each as it goes, asking before every change",
+        "pentrail setup [--yes] [--core-only] [--vpn-dir PATH] [--no-tools|--no-launcher|--no-shell|--no-ai] [--dry-run]",
+        ["Walks five steps and explains each as it goes, asking before every change",
          " (sudo only for the install and apt steps):",
          " 1. install this script to /usr/local/bin/pentrail so 'pentrail' works anywhere;",
          " 2. install missing tools with apt - core (openvpn, iproute2, ping, script) and,",
          "    unless --core-only, the enumeration set (nmap, ffuf, smbclient, hydra, ...);",
          " 3. set vpn_dir, create base_dir/vpn_dir, and - if the configured wordlist is",
          "    missing - find the directory wordlists on this machine and let you pick one;",
-         " 4. add the pcd() helper to your shell rc (idempotent).",
+         "    it also asks about auto_shot (off unless you say yes);",
+         " 4. add the pcd() helper to your shell rc (idempotent);",
+         " 5. copy the AI layer (PeTe) from the checkout's ai/ folder to",
+         "    ~/.local/share/pentrail/ai, so 'pentrail ai install' finds it. No project changes;",
+         "    pentrail works the same without it. --no-ai skips this step.",
          "It also explains how the VPN works (a persistent root daemon, no separate",
          " terminal needed). --yes runs it unattended; --dry-run shows the steps and",
          " changes nothing. termshot is not on apt, so it is only pointed to, not installed."],
@@ -5260,16 +7314,20 @@ DETAILS = {
         ["Finds the source checkout (the repo you run it from, or the one setup recorded",
          " in config as src_repo), runs 'git pull --ff-only' on the current branch, and",
          " reinstalls pentrail.py to /usr/local/bin/pentrail so the new code is live.",
+         "If setup copied the AI layer (PeTe) to ~/.local/share/pentrail/ai, it refreshes that",
+         " copy too; projects keep their PeTe until 'pentrail ai update --all'.",
          "--branch pulls and switches to another branch first (e.g. main after a merge);",
          " --no-install pulls only; --yes answers every prompt; --dry-run changes nothing.",
          "A diverged branch stops it (nothing is reinstalled) so your local work is safe;",
          " network errors on the pull are retried with backoff."],
         "pentrail update   ;   pentrail update --branch main --yes"),
     "uninstall": ("Undo 'pentrail setup' - remove what it installed, keep your work.",
-        "pentrail uninstall [--config] [--yes] [--dry-run]",
-        ["Removes the /usr/local/bin/pentrail launcher (sudo) and the pcd() helper from",
-         " your shell rc. If the VPN is still connected it offers to stop it first, since",
-         " the root daemon would otherwise be left with no 'pentrail down' to stop it.",
+        "pentrail uninstall [--config] [--no-launcher] [--yes] [--dry-run]",
+        ["Removes the /usr/local/bin/pentrail launcher (sudo), the pcd() helper from your",
+         " shell rc and the AI layer's copy in ~/.local/share/pentrail/ai. If the VPN is still",
+         " connected it offers to stop it first, since the root daemon would otherwise be",
+         " left with no 'pentrail down' to stop it. --no-launcher keeps the launcher.",
+         "Projects with PeTe in them keep it; 'pentrail ai remove <project>' takes it out.",
          "--config also deletes your config and VPN state (~/.config/pentrail and",
          " ~/.local/state/pentrail, including the redact list). Your pentest projects in",
          " base_dir are NEVER deleted - remove them yourself if you want them gone.",
@@ -5304,21 +7362,91 @@ DETAILS = {
          "Outcome: it joins 'pentrail creds' and the export lists."],
         "pentrail cred add svc_sql:Summer2024   ;   pentrail cred add 31d6cfe0...089c0"),
     "next": ("Decide what to enumerate next and see what you already did.",
-        "pentrail next",
+        "pentrail next [host] [--json]",
         ["Reads new files in 1-enum/scans/ and uses the ports pentrail knows for the active",
-         " box; per open service it lists the standard enumeration steps with the host",
-         " filled in, ticked [x] once a recorded command ran that step against that host.",
-         " The same checklist is in 1-enum/enum.md. The web brute-force step uses your configured",
-         " tool and wordlist: 'pentrail config web_tool feroxbuster|ffuf|gobuster' and",
-         " 'pentrail config wordlist <path>' (default a SecLists directory list).",
+         " box (or the host you name); per open service it lists the standard enumeration",
+         " steps with the host filled in, ticked [x] once a recorded command ran that step",
+         " against that host, whoever ran it. The same checklist is in 1-enum/enum.md. The web",
+         " brute-force step uses your configured tool and wordlist: 'pentrail config web_tool",
+         " feroxbuster|ffuf|gobuster' and 'pentrail config wordlist <path>'.",
+         "Coverage, below the per-port steps: a full TCP port scan, service versions (-sV) on",
+         " every open TCP port, the UDP top ports, and virtual hosts when there is a web port.",
+         " A scan of a range that holds the host counts; one that --excludes it does not.",
+         "--json: the plan for scripts and AI assistants. Every step has its source (playbook",
+         " or coverage), done or not, and the ids of the commands that did it. No credentials.",
          "Outcome: a per-service checklist and a call-out of untouched services."],
-        "pentrail next"),
+        "pentrail next   ;   pentrail next 10.10.10.6 --json"),
+    "ai": ("PeTe, pentrail's optional AI layer for Claude Code.",
+        "pentrail ai install|status|update|remove [project]  |  ai status|update --all  |  ai brief",
+        ["pentrail works the same without it. 'pentrail setup' copies the layer (ai/ in the repo)",
+         " to ~/.local/share/pentrail/ai; then, per project (default: the active one):",
+         "ai install: CLAUDE.md, .claude/skills/ (12 skills) and .claude/settings.json (permissions,",
+         " the hooks, PENTRAIL_ACTOR=pete and PENTRAIL_PROJECT=<the project>), the PeTe rules under",
+         " Rules of engagement in 0-scope/scope.md (once), and .claude/pentrail-ai.json with the",
+         " version. A CLAUDE.md of yours is kept as CLAUDE.md.bak; a settings.json of yours is",
+         " merged, never overwritten. Running it again changes nothing. 'new --ai' does the same.",
+         "ai status: installed or not, the version you have, missing files, hooks and rules, and",
+         " whether the 'pentrail' on PATH can run the hooks. Exit 1 when something is missing.",
+         "ai update: the PeTe you have into the project (--all: every project with PeTe). Files",
+         " of PeTe's you changed are kept as .bak. ai remove: takes out what ai install put in",
+         " (not files you changed); the PeTe rules stay in scope.md. The folder stays mode 700.",
+         "Then: cd into the project, run claude, and trust the folder. Claude Code calls two hooks:",
+         "sessionstart: the session brief (project, scope, PeTe rules, hosts and plan, what runs,",
+         " leads, findings, the last logbook lines; never credentials) becomes PeTe's context,",
+         " and you get a one-line greeting.",
+         "pretooluse: before every Bash command and web fetch PeTe makes. It stops commands aimed",
+         " at hosts outside the scope, and commands aimed at in-scope hosts that do not go through",
+         " 'pentrail shot' (with the shot command to use instead); scope overrides; edits of the",
+         " scope, logbook and PeTe's own files; and tools the PeTe rules deny (asks you for 'ask').",
+         " Everything else gets no decision from it: Claude Code's permission rules decide.",
+         " Stops are logged ('hook blocked', by pete).",
+         " PeTe never runs the pentrail commands that change its guardrails (scope add/out, the",
+         " guard, pete_rules, capture, ai install/update/remove, setup, update, uninstall).",
+         "ai statusline: the line Claude Code shows under the prompt: the project, the active",
+         " box, the phase, open leads, what runs now and the scope guard.",
+         "ai brief prints the brief, so you can see what PeTe sees."],
+        "pentrail new box1 10.10.10.5 --ai   ;   pentrail ai install box1   ;   pentrail ai status"),
+    "seen": ("Check whether something already ran against a host, before you run it.",
+        "pentrail seen <host> <tool|nse-script|text>",
+        ["Looks through every recorded command against the host: yours (captures, shots,",
+         " ingested files) and an AI assistant's. A tool name matches the tool, and ffuf,",
+         " feroxbuster, gobuster, dirsearch, dirb and wfuzz count as one; else an nmap script",
+         " name (ssl-cert, smb-vuln-*; -sC counts as 'default'); else any text in the command",
+         " line (-p-, raft-medium). full-tcp, versions, udp and vhosts ask the coverage checks.",
+         "A command running right now counts too: a shot in flight, or the command in your",
+         " capture. Exit 0 and the matching commands if it ran (or runs), 1 if not."],
+        "pentrail seen 10.10.10.5 gobuster   ;   pentrail seen 10.10.10.5 -p-"),
+    "trace": ("See what ran against each host, when, by whom and where its output is.",
+        "pentrail trace [-H host] [-t tool] [--json]",
+        ["Per host, oldest first: command id, time, phase, who ran it (you, or the name of an",
+         " AI assistant or script), where it came from (capture = a recording in evidence/*.log,",
+         " shot = evidence/*.txt, ingest = a tool file in scans/), exit code, the command and",
+         " its output file. A range scan is listed under every host in it, and so is a command",
+         " whose results landed on that host. 'Running now' lists what has not finished yet.",
+         "-t keeps one tool (or nmap script, or text). --json is for scripts: passwords in",
+         " command lines are masked."],
+        "pentrail trace -H 10.10.10.5   ;   pentrail trace -t nmap --json"),
+    "show": ("Read the output of one command again, without running it again.",
+        "pentrail show <id> [-n lines]",
+        ["Prints what a recorded command printed, colours and progress bars stripped, from",
+         " its command line on: for a capture the lines it spans in the recording, for a shot",
+         " its text evidence, for an ingested file the file itself. Ids are in 'pentrail",
+         " trace' and 'pentrail seen'. -n limits it (default 200 lines, 0 = all)."],
+        "pentrail show 12   ;   pentrail show 12 -n 0 | less"),
     "config": ("Show or change settings.",
         "pentrail config [key] [value]",
         ["No args prints all; a key prints its value; key + value sets it. Keys include",
          " base_dir, vpn_dir, default_vpn, web_tool, wordlist, termshot_cmd,",
-         " connect_timeout, stale_minutes, vpn_iface."],
-        "pentrail config web_tool ffuf   ;   pentrail config wordlist ~/lists/common.txt"),
+         " connect_timeout, stale_minutes, vpn_iface, scope_guard, scope_allow, author.",
+         "auto_shot on: in a capture, every command that finds something (a port, web path, name,",
+         " lead, credential) is kept as a screenshot of its command line and output, next to",
+         " the recording, and linked from the command ('pentrail trace' marks it).",
+         "pete_rules on: new projects get the PeTe rules in 0-scope/scope.md, under Rules of",
+         " engagement: what an AI assistant may run on its own (allow), only after your yes",
+         " (ask), or never (deny). Edit them per project. The report leaves them out.",
+         "ai_auto on: 'pentrail new' also puts PeTe in the project, as with --ai.",
+         "auto_shot, pete_rules and ai_auto are off until you turn them on (on/off, or true/false)."],
+        "pentrail config auto_shot on   ;   pentrail config ai_auto on"),
     "set": ("Keep project facts you reach for often.",
         "pentrail set <key> <value>   |   pentrail set",
         ["Stores a key/value on the project: domain, dc-ip, base-dn, url, anything. No",
@@ -5373,42 +7501,41 @@ def print_command_detail(name):
 
 def print_home(_args=None):
     print_banner()
-    print(f"\n{DIM}For authorized labs, engagements and bug bounty programs only.{N}\n")
+    print(f"\n  {DIM}For authorized labs, engagements and bug bounty programs only.{N}\n")
     d = current_dir()
     if d:
-        vpn = f"{G}up{N}" if vpn_running() else f"{R}down{N}"
-        print(f"Active project: {B}{d.name}{N}   VPN: {vpn}")
         project_summary(d, loglines=3)
-        print(f"\n{B}Carry on{N}")
+        print(f"\n{BOLD}Carry on{N}")
         _cmd("pentrail capture <phase>", "record a shell; scope-checked, auto-documented")
         _cmd("pentrail next", "what to enumerate next")
         _cmd("pentrail hosts", "hosts, ports and what you found")
         _cmd("pentrail finding <vector-id>", "a confirmed lead becomes a finding")
         _cmd("pentrail report --html", "the report, filled from your docs")
     else:
-        print("No active project.\n")
-        print(f"{B}Get started{N}")
+        box("no active project", [f"start one     {G}pentrail new <name> <target>{N}",
+                                  f"come back to  {G}pentrail resume{N}"])
+        print(f"\n{BOLD}Get started{N}")
         _cmd("pentrail setup", "install pentrail + missing tools, set vpn_dir")
         _cmd("pentrail new <name> <target>", "new project: phases, docs, scope, VPN")
         _cmd("pentrail resume", "resume the project you last worked on")
         _cmd("pentrail list", "list existing projects")
         projs = [x.name for x in _projects()]
         if projs:
-            print(f"\n{DIM}Projects: {', '.join(projs[:12])}{N}")
-    print(f"\n{B}A box from start to report{N}")
+            print(f"\n  {DIM}Projects: {', '.join(projs[:12])}{N}")
+    print(f"\n{BOLD}A box from start to report{N}")
     for i, step in enumerate(FLOW, 1):
-        print(f"  {DIM}{i}.{N} {step}")
-    print(f"\nAll commands: {G}pentrail help{N}   one command: {G}pentrail help <command>{N}")
+        print(f"  {C}{i}{N} {step}")
+    print(f"\n{DIM}All commands:{N} {G}pentrail help{N}   {DIM}one command:{N} {G}pentrail help <command>{N}")
 
 def print_help_guide(_args=None):
     print(f"{B}pentrail{N} - the pentest logbook (for authorized labs, engagements and bug bounties)\n")
     print("Usage: pentrail <command> [args]")
     print(f"       {DIM}pentrail help <command>   full explanation + example for one command{N}\n")
     for title, rows in HELP_SECTIONS:
-        print(f"{B}{title}{N}")
+        print(f"{C}{_u('▌', '#')}{N} {BOLD}{title}{N}")
         for row in rows:
             cmd, first, *more = row
-            if len(cmd) <= 30:
+            if len(cmd) < 30:
                 print(f"  {G}{cmd:<30}{N}{first}")
             else:
                 print(f"  {G}{cmd}{N}")
@@ -5420,6 +7547,8 @@ def print_help_guide(_args=None):
     for line in FLOW:
         print(f"  {DIM}${N} {line}")
     print(f"\nConfig lives in {CONFIG_FILE}")
+    print(f"{DIM}Environment: PENTRAIL_PROJECT=<project> pins a shell (or an AI session) to a project;"
+          f"\n             PENTRAIL_ACTOR=<name> records who ran the commands (an AI assistant, a script).{N}")
 
 DETAILS.update({
     "note": ("Jot something down about a target while you work.",
@@ -5438,13 +7567,15 @@ DETAILS.update({
          " in other notes do not end up pointing at a different note)."],
         "pentrail notes 10.10.10.6   ;   pentrail notes edit 4 \"creds work on SMB too\""),
     "new": ("Start a project: one folder per phase, working docs, scope and the VPN.",
-        "pentrail new <name> [target ...] [--no-vpn]",
+        "pentrail new <name> [target ...] [--no-vpn] [--ai | --no-ai]",
         ["Creates ~/pentests/<name>/ with 0-scope ... 5-report folders, a Markdown doc per",
          " phase, a logbook, and makes it the active project. Targets (IPs, ranges, domains,",
          " *.domain or URLs) go into 0-scope/scope.md as in scope; the first host becomes",
          " the active box. The VPN is connected unless you pass --no-vpn or have no .ovpn.",
+         "--ai also puts PeTe, the AI layer for Claude Code, in it (see 'pentrail help ai');",
+         " 'pentrail config ai_auto on' makes that the default, --no-ai skips it once.",
          "Outcome: a ready workspace; 'source .env' gives you $TARGET and $VPN_IP."],
-        "pentrail new blackfield 10.10.10.192   ;   pentrail new acme '*.acme.com' --no-vpn"),
+        "pentrail new blackfield 10.10.10.192   ;   pentrail new acme '*.acme.com' --no-vpn --ai"),
     "capture": ("Record the shell you work in; document everything it finds.",
         "pentrail capture [phase|label] [--warn | --guard strict|warn|off] [--plain]",
         ["Starts a recording shell (bash or zsh) in the phase you name (recon/enum, foothold,",
@@ -5459,15 +7590,20 @@ DETAILS.update({
          "--warn (or --guard strict|warn|off) sets the guard for this capture only: warn",
          " reports out-of-scope commands and logs them, but lets them run. Typing",
          " 'pentrail scope guard strict|warn|off' inside the capture switches it right away.",
-         "--plain records without the hook (no guard, the recording is split at prompts)."],
+         "--plain records without the hook (no guard, the recording is split at prompts).",
+         "With 'pentrail config auto_shot on', every command that finds something is kept as a",
+         " screenshot (text, and a PNG when termshot is installed) of its command line and output."],
         "pentrail capture recon   ;   pentrail capture privesc --warn"),
     "scope": ("Say what you may test; the capture shell enforces it.",
-        "pentrail scope [add|out|check|guard] ...",
+        "pentrail scope [add|out|check [--json]|resolve|guard] ...",
         ["The scope is 0-scope/scope.md: edit it or paste a program's scope under '## In",
          " scope' and '## Out of scope', one asset per line. Assets: 10.10.10.5,",
          " 10.10.10.0/24, 10.10.10.1-50, app.example.com, *.example.com, or a URL.",
          "add / out append to those sections; check tells you whether a host, URL or whole",
-         " command line is in scope; guard sets strict (stop), warn (report and log, let it",
+         " command line is in scope (no quotes needed) and answers with its exit code too:",
+         " 0 all in scope (or your own machine or a tooling host), 3 something is out of",
+         " scope, not in scope or a conflict, 2 no host found, 4 no scope set. --json prints",
+         " the verdicts for scripts. guard sets strict (stop), warn (report and log, let it",
          " run) or off. Run outside a capture, guard changes the setting; run inside one, it",
          " changes only that capture, at once. 'capture --warn' starts a capture in warn mode.",
          "Names and DNS: a hostname whose addresses all fall inside your in-scope IPs or",
@@ -5507,11 +7643,13 @@ DETAILS.update({
          " anywhere else in the files and pentrail leaves it alone."],
         "pentrail docs"),
     "hosts": ("See what you know about the hosts, without running anything again.",
-        "pentrail hosts [ip|name]",
+        "pentrail hosts [ip|name] [--json]",
         ["No args: every host with OS, owned flag and open ports, plus the movement chain.",
          "With a host: its ports with versions and the command that found each, web paths,",
-         " hostnames and leads."],
-        "pentrail hosts 10.10.10.5"),
+         " hostnames and leads.",
+         "--json: hosts, ports, names, web paths, leads and notes for scripts and AI",
+         " assistants; never credentials (passwords in leads and notes are masked)."],
+        "pentrail hosts 10.10.10.5   ;   pentrail hosts --json"),
     "names": ("Hostnames, vhosts and subdomains seen in scope.",
         "pentrail names [--plain]",
         ["Each with its IP when known and the command that found it. --plain prints one per",
@@ -5530,6 +7668,8 @@ def build_parser():
     s = sub.add_parser("new", help="start a project: phase folders, docs, scope, VPN")
     s.add_argument("name"); s.add_argument("targets", nargs="*")
     s.add_argument("--no-vpn", action="store_true", help="do not start the VPN")
+    s.add_argument("--ai", action="store_true", help="also put PeTe, the AI layer for Claude Code, in it")
+    s.add_argument("--no-ai", action="store_true", help="no PeTe, even with 'config ai_auto on'")
     s.set_defaults(func=cmd_new)
     s = sub.add_parser("use", help="switch to an existing project (no VPN)")
     s.add_argument("name"); s.set_defaults(func=cmd_use)
@@ -5542,7 +7682,11 @@ def build_parser():
     s.add_argument("name", nargs="?"); s.set_defaults(func=cmd_phase)
     sub.add_parser("docs", help="list the working docs and refresh them").set_defaults(func=cmd_docs)
     s = sub.add_parser("scope", help="scope: show | add | out | check | guard")
-    s.add_argument("action", nargs="?"); s.add_argument("rest", nargs="*"); s.set_defaults(func=cmd_scope)
+    s.add_argument("--json", action="store_true", help="scope check: the verdicts as JSON")
+    # REMAINDER: 'scope check nmap -sV 10.10.10.5' needs no quotes, and '--json' may come
+    # before or after what is checked (cmd_scope picks it out)
+    s.add_argument("action", nargs="?"); s.add_argument("rest", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_scope)
 
     s = sub.add_parser("up", aliases=["connect"], help="connect the VPN")
     s.add_argument("file", nargs="?"); s.set_defaults(func=lambda a: vpn_up(a.file))
@@ -5571,14 +7715,31 @@ def build_parser():
     s.set_defaults(func=cmd_capture)
     s = sub.add_parser("shot", help="screenshot a command (shot <cmd>) or recent capture output (shot --last)")
     s.add_argument("-l", "--label")
+    s.add_argument("-q", "--quiet", action="store_true",
+                   help="print only where it was saved and what was new; exit with the tool's exit code")
+    s.add_argument("--by", help="who runs it, kept with the command (default: $PENTRAIL_ACTOR, else you)")
     s.add_argument("--last", nargs="?", const=0, type=int,
                    help="screenshot the active capture's recent output (optionally last N lines)")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(func=cmd_shot)
     s = sub.add_parser("ingest", help="read a saved tool output file")
     s.add_argument("file"); s.set_defaults(func=cmd_ingest)
-    sub.add_parser("next", aliases=["suggest"],
-                   help="what to enumerate next on the active box").set_defaults(func=cmd_next)
+    s = sub.add_parser("next", aliases=["suggest"],
+                       help="what to enumerate next on the active box (or a host); coverage checks too")
+    s.add_argument("host", nargs="?", help="a host other than the active box")
+    s.add_argument("--json", action="store_true", help="the plan as JSON: playbook and coverage steps")
+    s.set_defaults(func=cmd_next)
+    s = sub.add_parser("seen", help="already run against a host? seen <host> <tool|nse-script|text>")
+    s.add_argument("host"); s.add_argument("what", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_seen)
+    s = sub.add_parser("trace", help="what ran per host: time, phase, who, capture/shot/ingest, output file")
+    s.add_argument("-H", "--host", help="one host"); s.add_argument("-t", "--tool", help="one tool (or script, or text)")
+    s.add_argument("--json", action="store_true", help="as JSON (no credentials)")
+    s.set_defaults(func=cmd_trace)
+    s = sub.add_parser("show", help="the recorded output of one command: show <id> [-n lines]")
+    s.add_argument("id"); s.add_argument("-n", "--lines", dest="n", type=int,
+                                         help="lines to print (default 200, 0 = all)")
+    s.set_defaults(func=cmd_show)
 
     s = sub.add_parser("vector", aliases=["vectors"], help='leads: list | add "<desc>" [-t type] | <status> <id> | rm <id>')
     s.add_argument("action", nargs="?"); s.add_argument("rest", nargs="*")
@@ -5599,7 +7760,9 @@ def build_parser():
     s.add_argument("action"); s.add_argument("rest", nargs="*"); s.set_defaults(func=cmd_redact)
 
     s = sub.add_parser("hosts", aliases=["map"], help="hosts with ports; one host in detail")
-    s.add_argument("ip", nargs="?"); s.set_defaults(func=cmd_hosts)
+    s.add_argument("ip", nargs="?")
+    s.add_argument("--json", action="store_true", help="as JSON: ports, names, web, leads, notes (no credentials)")
+    s.set_defaults(func=cmd_hosts)
     s = sub.add_parser("host", help="host add <ip> [name] [os] | own <ip> | rm <ip> | <ip>")
     s.add_argument("action"); s.add_argument("ip", nargs="?")
     s.add_argument("name", nargs="?"); s.add_argument("os", nargs="?"); s.set_defaults(func=cmd_host)
@@ -5627,6 +7790,7 @@ def build_parser():
     s.add_argument("--no-tools", action="store_true", help="do not install any tools")
     s.add_argument("--no-launcher", action="store_true", help="do not install pentrail to /usr/local/bin")
     s.add_argument("--no-shell", action="store_true", help="do not touch your shell rc")
+    s.add_argument("--no-ai", action="store_true", help="do not copy the AI layer (PeTe) to ~/.local/share/pentrail")
     s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
     s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     s.set_defaults(func=cmd_setup)
@@ -5639,9 +7803,13 @@ def build_parser():
     s.set_defaults(func=cmd_update)
     s = sub.add_parser("uninstall", help="undo setup: remove the launcher + shell helper (--config also removes settings)")
     s.add_argument("--config", action="store_true", help="also remove config + VPN state (projects are kept)")
+    s.add_argument("--no-launcher", action="store_true", help="keep the launcher in /usr/local/bin")
     s.add_argument("-y", "--yes", action="store_true", help="assume yes (non-interactive)")
     s.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     s.set_defaults(func=cmd_uninstall)
+    s = sub.add_parser("ai", help="PeTe, the AI layer for Claude Code: ai brief | ai hook <event>")
+    s.add_argument("action", nargs="?"); s.add_argument("rest", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_ai)
     s = sub.add_parser("help", help="full usage guide (or: pentrail help <command>)")
     s.add_argument("topic", nargs="?"); s.set_defaults(func=None)
     return p
@@ -5668,6 +7836,16 @@ def main():
     if sys.version_info < (3, 8):
         sys.exit("pentrail needs Python 3.8 or newer (found "
                  f"{sys.version_info.major}.{sys.version_info.minor}).")
+    if sys.argv[1:3] == ["ai", "hook"]:                    # called by Claude Code: JSON only
+        sys.exit(ai_hook_main(sys.argv[3:]))
+    if sys.argv[1:3] == ["ai", "statusline"]:              # called by Claude Code: one line
+        try:
+            raw = "" if sys.stdin.isatty() else sys.stdin.read()
+            data = json.loads(raw) if raw.strip() else {}
+            print(ai_statusline(data if isinstance(data, dict) else {}))
+        except Exception:
+            print("PeTe")
+        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "_hook":       # called by the capture shell
         try:
             sys.exit(hook_main(sys.argv[2:]))
