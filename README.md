@@ -116,6 +116,12 @@ IP range (`10.10.10.1-50`), a domain, a wildcard (`*.acme.com`, which covers the
 subdomains but not `acme.com` itself) or a URL. An out-of-scope URL with a path, like
 `https://acme.com/blog`, excludes only that path.
 
+`pentrail scope check` takes hosts, URLs or a whole command line
+(`pentrail scope check nmap -sV 10.10.10.5`, no quotes needed) and answers with its exit
+code too, so scripts can use it: `0` everything is in scope (or is your own machine or a
+tooling host), `3` something is out of scope, not in scope or a conflict, `2` no host
+found, `4` no scope set. `--json` prints the verdicts.
+
 What the scope does:
 
 - **The capture shell stops commands that point outside it.** Before a command runs,
@@ -213,7 +219,16 @@ pentrail hosts 10.10.10.5      # one host: ports + versions + who found them, we
 pentrail names                 # hostnames and subdomains in scope
 pentrail names --plain         # one per line, to feed other tools
 pentrail vectors               # leads, working > open > done > dead
+pentrail seen 10.10.10.5 gobuster   # already run against that host? exit 0 + the commands, 1 if not
+pentrail trace -H 10.10.10.5   # what ran: time, phase, who, capture/shot/ingest, output file
+pentrail show 12               # the output of command #12 again, from its command line on
 ```
+
+`seen` treats ffuf, feroxbuster, gobuster, dirsearch, dirb and wfuzz as one tool, and
+also takes an nmap script name (`ssl-cert`, `smb-vuln-*`; `-sC` counts as `default`) or
+any text in the command line (`-p-`, `raft-medium`). A range scan counts for every host
+in it, unless it left the host out with `--exclude`. A command that is still running
+counts too, so you never start the same scan twice.
 
 ### Notes, linked to your targets
 
@@ -242,7 +257,16 @@ any doc.
 PNG (via [termshot](https://github.com/homeport/termshot)) and the text in the current
 phase's `evidence/`. Its output is read with this command as "Found by". During a
 capture, `pentrail shot --last` screenshots what you just ran, without running it again.
-Without termshot it keeps the text evidence.
+Without termshot it keeps the text evidence. `pentrail shot -q` keeps the terminal quiet
+and exits with the tool's own exit code; see [AI layer](#ai-layer-claude-code).
+
+**Auto-shot.** With `pentrail config auto_shot on`, a capture keeps every command that
+finds something (a new port, web path, hostname, lead, credential or fact) as a
+screenshot: its command line and its output, as `<phase>/evidence/<box>_<date>_found-<tool>.txt`
+and, when termshot is installed, as a PNG rendered in the background so your prompt comes
+back at once. The capture shell shows `◉ evidence: ...` under the command, `pentrail trace`
+marks the command with `◉`, and a finding made from it lists the screenshot as evidence. No
+AI involved; it is off until you turn it on.
 
 ### Your own secrets stay out
 
@@ -319,6 +343,146 @@ Every action lands in `logbook.md` with a time and a tag: captures, new leads, n
 scope blocks, warnings and overrides, phase changes, findings and reports.
 `pentrail log` shows it.
 
+## AI layer (Claude Code)
+
+pentrail ships its own AI layer for Claude Code in [`ai/`](ai/README.md): **PeTe**, an
+assistant that works the pentrail way from the first message, for scoping, recon,
+enumeration, triage and reporting. It does not exploit anything. Everything it runs goes
+through the same scope guard as your own commands, is recorded with its output, and is
+marked as PeTe's. You stay responsible for every command it runs ([ai/TERMS.md](ai/TERMS.md)).
+
+**PeTe is optional.** pentrail does everything in this README on its own; nothing about
+the AI layer shows up until you install it in a project. Without it, pentrail is the same
+tool it always was.
+
+### Putting PeTe in a project
+
+```bash
+pentrail setup                       # step 5 copies ai/ to ~/.local/share/pentrail/ai
+pentrail new box1 10.10.10.5 --ai    # a new project with PeTe in it
+pentrail ai install [project]        # or an existing one (default: the active project)
+cd ~/pentests/box1 && claude         # and trust the folder when Claude Code asks
+```
+
+`pentrail ai install` writes `CLAUDE.md`, `.claude/skills/` (12 skills) and
+`.claude/settings.json` into the project folder, adds the PeTe rules once under "Rules of
+engagement" in `0-scope/scope.md`, and records what it installed in
+`.claude/pentrail-ai.json` (the version, a hash of every file, every settings entry it
+added). The settings set `PENTRAIL_ACTOR=pete` and `PENTRAIL_PROJECT=<the project>`, so
+what PeTe runs is marked as its own and lands in this project, whichever project is active
+in your terminals. Running it again changes nothing. A `CLAUDE.md` of your own is kept as
+`CLAUDE.md.bak`; a `.claude/settings.json` of your own is merged (rule lists and hooks
+joined, your values kept), never overwritten. The project folder stays mode 700, and the
+files hold no secrets: they are the same for every project.
+
+- `pentrail ai status [project]`: the installed and the available version, and anything
+  missing (files, hooks, the rules, a `pentrail` on your PATH that can run the hooks).
+  Exit 1 when something is. `--all` lists every project with PeTe.
+- `pentrail ai update [project|--all]`: brings a project to the PeTe you have. A file of
+  PeTe's that you changed is kept as `.bak` next to the new one.
+- `pentrail ai remove [project]`: takes out only what `ai install` put in (not files you
+  changed since), puts your own `CLAUDE.md` back and takes PeTe's entries out of your
+  settings. The PeTe rules stay in `scope.md`.
+- `pentrail config ai_auto on`: `pentrail new` puts PeTe in every new project, as with
+  `--ai`; `--no-ai` skips it once. Off by default.
+
+The layer comes with the pentrail you run: the `ai/` folder next to `pentrail.py` when you
+run it from the checkout, else setup's copy in `~/.local/share/pentrail/ai`, else the `ai/`
+folder of the checkout setup remembered (`pentrail config src_repo`). `pentrail update`
+refreshes setup's copy and `pentrail uninstall` removes it; neither touches your projects.
+
+### What it does in a session
+
+When PeTe is installed in a project, Claude Code calls two pentrail hooks:
+
+- **The guardrail** (`pentrail ai hook pretooluse`) runs before every Bash command and web
+  fetch PeTe makes. It stops a command aimed at a host outside the scope, and a command
+  aimed at an in-scope host that does not go through `pentrail shot` (so it would not be
+  checked or recorded): PeTe gets the exact `pentrail shot -q --by pete ...` command to use
+  instead. It also stops scope overrides, edits of `0-scope/`, the logbook, `state.json` and
+  PeTe's own files, and the tools the PeTe rules deny (hydra, sqlmap, msfconsole, nmap brute
+  scripts, ...); for tools they mark `ask` (nikto, nuclei, vuln scripts, `sudo`, credentials
+  on the command line) you get a permission prompt. PeTe never runs the pentrail commands
+  that change its own guardrails (`scope add|out|guard`, `config scope_guard|pete_rules`,
+  `capture`, `ai install|update|remove`, `setup`, `update`, `uninstall`), whatever the
+  permission rules say. Everything else gets no decision from
+  the hook, so Claude Code's own permission rules decide. Every stop is in the logbook as
+  `hook blocked: ... (by pete)`, and a guard that fails blocks instead of letting the call
+  through.
+- **The session brief** (`pentrail ai hook sessionstart`) puts a compact page into PeTe's
+  context when a session starts: project, phase, scope and guard, the PeTe rules, the
+  rules of engagement, hosts with their plan, what is running, open leads, findings and the
+  last logbook lines, never credentials. You get a one-line greeting, and the session is
+  named after the project. `pentrail ai brief` prints the same page for you.
+- **The status line** (`pentrail ai statusline`) sits under Claude Code's prompt the whole
+  session: `PeTe ◕‿◕ · box1 · box 10.10.10.5 · enum · 2 open lead(s) · ◷ 1 running ·
+  guard strict`. A `statusLine` of your own in the project settings is kept.
+
+What the layer holds: PeTe's master prompt (`ai/claude/CLAUDE.md`: Rule 0, how it teaches,
+what it asks before and never does), 12 skills (session start, methodology, scope guard,
+pentrail, enumeration rounds, passive and active recon, services, web, Active Directory,
+triage, findings and the report), the Claude Code permissions (`ai/claude/settings.json`)
+and the **PeTe rules** (`ai/claude/rules.md`).
+
+The PeTe rules say what the assistant may run on its own (`allow`, after one "go" per
+round), only after your yes (`ask`), or never (`deny`), per activity: passive recon, port
+scans and their rate, service enumeration, web content discovery, vulnerability scripts,
+credentialed enumeration, root commands, brute force, password spraying, exploitation and
+denial of service. They live under "Rules of engagement" in `0-scope/scope.md`, and you
+edit them per project. `pentrail config pete_rules on` puts them into new projects even
+without the AI layer; the report leaves them out of its rules of engagement.
+
+The building blocks in pentrail itself:
+
+- **Quiet runs.** `pentrail shot -q --by <name> -l <label> -- <command>` runs a command
+  the way `shot` always does (scope check, evidence file, parsing), but prints only where
+  the output was saved and what was new, and exits with the tool's own exit code. Exit `3`
+  is kept for "blocked by the scope guard" (a tool's own `3` becomes `1`), and the BLOCKED
+  message goes to stderr. Scope warnings that do not block also go to stderr.
+- **Who ran it.** `--by <name>`, or `PENTRAIL_ACTOR=<name>` in the environment, records who
+  ran a command, in the command record's `via` field. It shows in the logbook
+  (`... (by pete)`), in "Found by" in the docs and in `pentrail hosts`, and as a By column
+  in the commands tables of the phase docs and the report appendix. Commands you run
+  yourself carry no name, and the tables only get the column once someone else ran
+  something. A command with an actor can never override the scope guard: `scope-ok` and
+  `PENTRAIL_SCOPE_OK=1` are refused (exit 3) and logged as a refused override.
+- **Side by side.** You and the assistant can work on the same project at the same time:
+  your capture in one terminal, its shots in another. Every change to `state.json` holds
+  a per-project lock, so neither overwrites the other's results, and `next` ticks a step
+  no matter who ran it.
+- **What ran, and what runs now.** `pentrail seen <host> <tool>`, `pentrail trace` and
+  `pentrail show <id>` let the assistant check what was already done (by you or by it)
+  and read the output again instead of rerunning a scan. Commands in flight count: a
+  `shot` registers itself while it runs, and the command running in your capture is read
+  from its recording. `seen` reports both as "running now".
+- **Plans as JSON.** `pentrail next [host] --json` gives the per-port playbook plus the
+  coverage checks (full TCP scan, `-sV` on every open TCP port, UDP top ports, virtual
+  hosts when there is a web port), each step marked done with the ids of the commands
+  that did it. `pentrail hosts --json` and `pentrail trace --json` give hosts and
+  commands. No JSON output ever holds a credential: stored secrets, your redacted values
+  and password arguments (`-p`, `--password`, `user:pass@host`, `-H <hash>`, ...) become
+  `[secret]`.
+- **One project per session.** `PENTRAIL_PROJECT=<project>` (a path or a name) pins a
+  shell or an assistant's session to its project, so `pentrail use` in another terminal
+  does not move it.
+- **Scope answers in exit codes.** `pentrail scope check` exits `0` (in scope), `3` (out of
+  scope, not in scope or a conflict), `2` (no host found) or `4` (no scope set), and
+  `--json` gives the verdicts:
+
+```json
+{
+  "input": "nmap -sV 10.10.10.5 8.8.8.8",
+  "status": "out",
+  "exit": 3,
+  "guard": "strict",
+  "targets": [
+    {"target": "10.10.10.5", "verdict": "in", "text": "in scope", "why": ""},
+    {"target": "8.8.8.8", "verdict": "unknown", "text": "not in scope", "why": ""}
+  ],
+  "notes": []
+}
+```
+
 ## Install
 
 ```bash
@@ -326,18 +490,28 @@ python3 pentrail.py setup          # guided; --yes for unattended, --dry-run to 
 ```
 
 `setup` puts `pentrail` on your `$PATH`, installs missing tools with `apt`, sets
-`vpn_dir`, finds a directory wordlist if the configured one is missing, and adds the
-`pcd` shell helper (`cd` into the project with `$TARGET` set). It asks before every
-change and uses `sudo` only for the install and `apt` steps. By hand:
+`vpn_dir`, finds a directory wordlist if the configured one is missing, adds the
+`pcd` shell helper (`cd` into the project with `$TARGET` set) and, optionally, copies the
+AI layer to `~/.local/share/pentrail/ai` (`--no-ai` skips that). It asks before every
+change and uses `sudo` only for the install and `apt` steps. Run interactively, it also
+asks whether to turn on `auto_shot`. By hand:
 `sudo install -m 755 pentrail.py /usr/local/bin/pentrail`.
 
-`pentrail update` pulls the source checkout and reinstalls the launcher.
-`pentrail uninstall` removes the launcher and the shell helper; your projects are
-never deleted. Config lives in `~/.config/pentrail/config.json` and VPN state in
+`pentrail update` pulls the source checkout, reinstalls the launcher and refreshes the AI
+layer's copy if you have one. `pentrail uninstall` removes the launcher, the shell helper
+and the AI layer's copy (`--no-launcher` keeps the launcher); your projects are never
+deleted, and PeTe stays in the projects that have it. Config lives in `~/.config/pentrail/config.json` and VPN state in
 `~/.local/state/pentrail/`.
+
+`pentrail doctor` checks the tools, your config and the `pentrail` on your PATH: when that
+copy is older than the checkout you run doctor from, it says so (`pentrail update`).
 
 Run pentrail as your normal user. It calls `sudo` itself only for openvpn and
 `/etc/hosts`, and the capture shell always runs as you.
+
+In a UTF-8 terminal pentrail draws its logo, project card and checklists with symbols
+(✔ ✖ ⚠ ➜ ○); elsewhere it falls back to plain `[+] [*] [!] [-]`. Colours appear only on a
+terminal, and never when `NO_COLOR` is set.
 
 ## VPN
 
@@ -351,18 +525,22 @@ VPN when it hangs. `new` connects automatically unless you pass `--no-vpn` or ha
 
 | Command | What it does |
 |---|---|
-| `new <name> [target...] [--no-vpn]` | create a project: phase folders, docs, scope, VPN |
+| `new <name> [target...] [--no-vpn] [--ai\|--no-ai]` | create a project: phase folders, docs, scope, VPN; `--ai` with PeTe |
 | `resume [name]` / `use <name>` | come back (with VPN and recap) / switch projects |
 | `list` | all projects |
 | `target <host>` | set the active box (IP or hostname) |
 | `phase [name]` | show or set the phase |
 | `docs` | list the working docs, refresh them |
 | `scope [add\|out\|check\|resolve\|guard]` | the scope, DNS lookups and conflicts, and the guard |
+| `scope check [--json] <host\|cmd>` | in scope? exit 0 in, 3 out / not in scope / conflict, 2 no host, 4 no scope |
 | `capture [phase] [--warn] [--plain]` | record a shell: scope guard, per-command docs |
-| `shot [-l label] <cmd>` / `shot --last` | screenshot evidence |
+| `shot [-q] [--by name] [-l label] <cmd>` / `shot --last` | screenshot evidence; `-q` quiet, tool's exit code; `--by` who ran it |
 | `ingest <file>` | read a saved tool output |
-| `next` | enumeration checklist for the active box |
-| `hosts [host]` / `names [--plain]` | look up hosts, ports, web paths, hostnames |
+| `next [host] [--json]` | enumeration checklist for the active box (or a host), with coverage checks |
+| `seen <host> <tool\|script\|text>` | already run (or running) against that host? exit 0 yes, 1 no |
+| `trace [-H host] [-t tool] [--json]` | what ran per host: time, phase, who, source, output file |
+| `show <id> [-n lines]` | the recorded output of one command |
+| `hosts [host] [--json]` / `names [--plain]` | look up hosts, ports, web paths, hostnames |
 | `vector(s) [type]`, `vector add\|<status>\|rm` | leads |
 | `cred(s)`, `cred add\|rm\|users\|passwords\|hashes\|export` | credentials |
 | `finding [<id>\|"title"\|F01] [-s sev]` | findings |
@@ -373,7 +551,21 @@ VPN when it hangs. `new` connects automatically unless you pass `--no-vpn` or ha
 | `redact add\|list\|clear` | keep your own secrets out of captures |
 | `up`, `down`, `restart`, `status`, `check`, `watch` | VPN |
 | `resolve [ip] <name...>` / `resolve --clean` | `/etc/hosts` entries |
-| `config [key] [value]` | settings: base_dir, vpn_dir, scope_guard, scope_allow, author, web_tool, wordlist, ... |
+| `config [key] [value]` | settings: base_dir, vpn_dir, scope_guard, scope_allow, author, web_tool, wordlist, auto_shot, pete_rules, ai_auto, ... |
+| `ai install\|update\|remove [project]` | PeTe (optional): put it in a project, update it, take it out |
+| `ai status [project\|--all]`, `ai update --all` | installed vs available, what is missing; update every project |
+| `ai brief` / `ai hook pretooluse\|sessionstart` / `ai statusline` | PeTe: the session brief; the hooks and the status line Claude Code runs |
 | `doctor`, `setup`, `update`, `uninstall`, `version`, `help` | housekeeping |
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Standard library only, under a throwaway `$HOME`, with no network traffic and no `sudo`. The
+suite covers the scope guard and its exit codes, a real capture, parsing, password masking, the guardrail
+hook, the session brief, and installing, merging and removing the AI layer. GitHub Actions
+runs it on Python 3.8, 3.10 and 3.13 (`.github/workflows/tests.yml`).
